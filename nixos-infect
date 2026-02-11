@@ -10,6 +10,144 @@ autodetectProvider() {
   fi
 }
 
+# --- Feature detection helpers ---
+
+detectVirtualization() {
+  # Returns the detected virtualization type. Possible values include:
+  # vmware, kvm, qemu, microsoft, oracle, xen, none (bare metal),
+  # lxc, docker, openvz, systemd-nspawn, podman, wsl, or unknown.
+
+  if command -v systemd-detect-virt &>/dev/null; then
+    systemd-detect-virt 2>/dev/null || echo "unknown"
+    return
+  fi
+  # Fallback: check DMI
+  if [ -r /sys/class/dmi/id/sys_vendor ]; then
+    local vendor
+    vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)
+    case "$vendor" in
+      *VMware*)       echo "vmware" ;;
+      *QEMU*|*KVM*)   echo "kvm" ;;
+      *Xen*)          echo "xen" ;;
+      *Microsoft*)    echo "microsoft" ;;
+      *innotek*|*Oracle*) echo "oracle" ;;
+      *)              echo "unknown" ;;
+    esac
+    return
+  fi
+  echo "unknown"
+}
+
+detectLVM() {
+  # Check if root filesystem is on an LVM logical volume
+  local rootdev
+  rootdev=$(mount | grep "on / type" | awk '{print $1;}')
+
+  # Method 1: Check if device is under /dev/mapper/ or /dev/<vg>/<lv>
+  if [[ "$rootdev" == /dev/mapper/* ]] || [[ "$rootdev" == /dev/dm-* ]]; then
+    # Verify it's actually LVM (not LUKS or plain dm)
+    if command -v lvs &>/dev/null; then
+      lvs "$rootdev" &>/dev/null && return 0
+    fi
+    # Fallback: check dm uuid prefix
+    local dm_name
+    dm_name=$(basename "$(readlink -f "$rootdev")" 2>/dev/null || basename "$rootdev")
+    if [[ -r "/sys/class/block/$dm_name/dm/uuid" ]]; then
+      grep -q "^LVM-" "/sys/class/block/$dm_name/dm/uuid" && return 0
+    fi
+  fi
+
+  # Method 2: Check if any dm device has an LVM uuid (catches /dev/<vg>/<lv> paths)
+  for dm in /sys/class/block/dm-*/dm/uuid; do
+    [[ -r "$dm" ]] && grep -q "^LVM-" "$dm" && return 0
+  done
+
+  return 1
+}
+
+detectStorageModules() {
+  # Detect which storage controller kernel modules are needed based on
+  # the hypervisor and hardware present
+  local virt="$1"
+  local modules=()
+
+  case "$virt" in
+    vmware)
+      # VMware PVSCSI and fallback SCSI controllers
+      modules+=("vmw_pvscsi" "mptspi" "ahci" "sd_mod")
+      ;;
+    kvm|qemu)
+      # Virtio and fallback
+      modules+=("virtio_pci" "virtio_blk" "virtio_scsi" "ahci" "sd_mod")
+      ;;
+    microsoft)
+      # Hyper-V storage
+      modules+=("hv_storvsc" "hv_vmbus" "sd_mod")
+      ;;
+    oracle)
+      # VirtualBox — include virtio in case paravirtualized storage is enabled
+      modules+=("ahci" "sd_mod" "virtio_pci" "virtio_blk" "virtio_scsi")
+      ;;
+    xen)
+      modules+=("xen_blkfront")
+      ;;
+    none)
+      # Physical hardware — include a broad set of common storage controllers
+      # since we can't predict what hardware is present
+      modules+=("ahci" "sd_mod" "nvme" "megaraid_sas" "mpt3sas" "aacraid"
+                "hpsa" "virtio_pci" "virtio_blk" "virtio_scsi")
+      ;;
+    *)
+      # Unknown virtualization — include common VM and physical modules
+      modules+=("ahci" "sd_mod" "virtio_pci" "virtio_blk" "virtio_scsi"
+                "hv_storvsc" "xen_blkfront" "nvme")
+      ;;
+  esac
+
+  # Always include common modules
+  modules+=("ata_piix" "uhci_hcd")
+
+  # Detect additional modules from currently loaded kernel modules
+  # that are relevant to storage
+  local storage_pattern="(nvme|virtio_blk|virtio_scsi|virtio_pci|vmw_pvscsi|mptspi|mpt3sas|megaraid_sas|aacraid|hpsa|ahci|sd_mod|sr_mod|xen_blkfront|hv_storvsc|hv_vmbus)"
+  while IFS= read -r mod; do
+    # Only add if not already in the list
+    local found=0
+    for existing in "${modules[@]}"; do
+      [[ "$existing" == "$mod" ]] && found=1 && break
+    done
+
+    [[ $found -eq 0 ]] && modules+=("$mod")
+  done < <(lsmod 2>/dev/null | awk 'NR>1 {print $1}' | grep -E "$storage_pattern" || true)
+
+  # Also check for NVMe (common in many environments)
+  [[ -d /sys/class/nvme ]] && {
+    local has_nvme=0
+    for m in "${modules[@]}"; do [[ "$m" == "nvme" ]] && has_nvme=1 && break; done
+    [[ $has_nvme -eq 0 ]] && modules+=("nvme")
+  }
+
+  # Return unique modules as quoted nix list items
+  printf '%s\n' "${modules[@]}" | sort -u
+}
+
+detectInitrdKernelModules() {
+  # Detect kernel modules that must be force-loaded in initrd (not just available).
+  # These are modules the initrd needs to activate before it can find the root device.
+  local modules=()
+
+  if detectLVM; then
+    # dm-mod: core device-mapper module required for any DM operation
+    # dm-snapshot: required for LVM snapshot support during boot
+    # dm-mirror: required for mirrored LVM volumes
+    modules+=("dm-mod" "dm-snapshot" "dm-mirror")
+  fi
+
+  printf '%s\n' "${modules[@]}" | sort -u
+}
+
+# --- End feature detection helpers ---
+
 makeConf() {
   # Skip everything if main config already present
   [[ -e /etc/nixos/configuration.nix ]] && return 0
@@ -72,23 +210,110 @@ EOF
 )
   fi
 
-  availableKernelModules=('"ata_piix"' '"uhci_hcd"' '"xen_blkfront"')
-  if isX86_64; then
-    availableKernelModules+=('"vmw_pvscsi"')
+  # --- Feature detection for hardware-configuration.nix ---
+  local virt
+  virt=$(detectVirtualization)
+  echo "nixos-infect: detected virtualization: $virt"
+
+  # Build availableKernelModules from detected storage hardware
+  availableKernelModules=()
+  while IFS= read -r mod; do
+    [[ -n "$mod" ]] && availableKernelModules+=("\"$mod\"")
+  done < <(detectStorageModules "$virt")
+  echo "nixos-infect: initrd availableKernelModules: ${availableKernelModules[*]}"
+
+  # Build initrd kernelModules (force-loaded)
+  initrdKernelModules=()
+  while IFS= read -r mod; do
+    [[ -n "$mod" ]] && initrdKernelModules+=("\"$mod\"")
+  done < <(detectInitrdKernelModules)
+
+  # Only force-load nvme in initrd if NVMe hardware is actually present
+  if [[ -d /sys/class/nvme ]]; then
+    initrdKernelModules+=('"nvme"')
+  fi
+  echo "nixos-infect: initrd kernelModules: ${initrdKernelModules[*]}"
+
+  # Detect LVM and generate appropriate config
+  local lvmcfg=""
+  if detectLVM; then
+    echo "nixos-infect: LVM detected on root filesystem"
+    lvmcfg="  services.lvm.enable = true;
+  boot.initrd.services.lvm.enable = true;"
+  fi
+
+  # Choose the appropriate guest profile/module based on virtualization.
+  # Use NixOS virtualisation modules where available for proper guest
+  # tooling (open-vm-tools, VirtualBox guest additions, etc).
+  local guest_profile=""
+  case "$virt" in
+    vmware)
+      guest_profile='  virtualisation.vmware.guest.enable = true;'
+      ;;
+    kvm|qemu)
+      guest_profile='  imports = [ (modulesPath + "/profiles/qemu-guest.nix") ];'
+      ;;
+    microsoft)
+      guest_profile='  imports = [ (modulesPath + "/profiles/hyperv-guest.nix") ];'
+      ;;
+    oracle)
+      guest_profile='  virtualisation.virtualbox.guest.enable = true;'
+      ;;
+    xen)
+      guest_profile='  imports = [ (modulesPath + "/profiles/qemu-guest.nix") ];'
+      ;;
+    none)
+      # Bare metal / physical hardware — no guest profile needed
+      guest_profile='  # Physical hardware detected — no guest profile'
+      ;;
+    lxc|docker|openvz|systemd-nspawn|podman|wsl)
+      # Container environments — guest profiles are not applicable
+      echo "nixos-infect: WARNING: container virtualization ($virt) detected, guest profiles skipped"
+      guest_profile="  # Container virtualization ($virt) detected — no guest profile"
+      ;;
+    *)
+      # Unknown hypervisor — don't assume qemu, rely on detected modules
+      echo "nixos-infect: WARNING: unknown virtualization type '$virt', no guest profile imported"
+      guest_profile="  # Unknown virtualization: $virt"
+      ;;
+  esac
+
+  # Resolve root device path for NixOS config.
+  # For LVM, use the device-mapper path directly so NixOS knows to
+  # activate LVM (vgchange -ay) in the initrd before mounting root.
+  # For non-LVM, resolve to UUID for more stable boot config.
+  local rootfs_device_cfg
+  if detectLVM; then
+    rootfs_device_cfg="$rootfsdev"
+    echo "nixos-infect: LVM root — using device path: $rootfs_device_cfg"
+  else
+    local rootfs_uuid
+    rootfs_uuid=$(blkid -s UUID -o value "$rootfsdev" 2>/dev/null || true)
+    if [[ -n "$rootfs_uuid" ]]; then
+      rootfs_device_cfg="/dev/disk/by-uuid/$rootfs_uuid"
+      echo "nixos-infect: root device $rootfsdev resolved to UUID: $rootfs_uuid"
+    else
+      rootfs_device_cfg="$rootfsdev"
+      echo "nixos-infect: root device $rootfsdev (no UUID found, using device path)"
+    fi
   fi
 
   # If you rerun this later, be sure to prune the filesSystems attr
   cat > /etc/nixos/hardware-configuration.nix << EOF
 { modulesPath, ... }:
 {
-  imports = [ (modulesPath + "/profiles/qemu-guest.nix") ];
+$guest_profile
 $bootcfg
   boot.initrd.availableKernelModules = [ ${availableKernelModules[@]} ];
-  boot.initrd.kernelModules = [ "nvme" ];
-  fileSystems."/" = { device = "$rootfsdev"; fsType = "$rootfstype"; };
+  boot.initrd.kernelModules = [ ${initrdKernelModules[@]} ];
+  fileSystems."/" = { device = "$rootfs_device_cfg"; fsType = "$rootfstype"; };
+$lvmcfg
   $swapcfg
 }
 EOF
+
+  echo "nixos-infect: generated hardware-configuration.nix:"
+  cat /etc/nixos/hardware-configuration.nix
 
   [[ -n "$doNetConf" ]] && makeNetworkingConf || true
 }
@@ -99,6 +324,7 @@ makeLightsailConf() {
 { config, pkgs, modulesPath, lib, ... }:
 {
   imports = [ "\${modulesPath}/virtualisation/amazon-image.nix" ];
+
   boot.loader.grub.device = lib.mkForce "/dev/nvme0n1";
 }
 EOF
@@ -390,14 +616,14 @@ if [ ! -v PROVIDER ]; then
   autodetectProvider
 fi
 
-[ "$PROVIDER" = "digitalocean" ] && doNetConf=y # digitalocean requires detailed network config to be generated
 [ "$PROVIDER" = "lightsail" ] && newrootfslabel="nixos"
 if [[ "$PROVIDER" = "digitalocean" ]] || [[ "$PROVIDER" = "servarica" ]] || [[ "$PROVIDER" = "hetznercloud" ]]; then
-	doNetConf=y # some providers require detailed network config to be generated
+	doNetConf=y # these providers require detailed network config to be generated
 fi
 
 checkEnv
 prepareEnv
+
 checkExistingSwap
 if [[ -z "$NO_SWAP" ]]; then
     makeSwap # smallest (512MB) droplet needs extra memory!
