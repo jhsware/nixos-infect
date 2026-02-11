@@ -105,9 +105,9 @@ detectStorageModules() {
   modules+=("ata_piix" "uhci_hcd")
 
   # Detect additional modules from currently loaded kernel modules
-
   # that are relevant to storage
   local storage_pattern="(nvme|virtio_blk|virtio_scsi|virtio_pci|vmw_pvscsi|mptspi|mpt3sas|ahci|sd_mod|sr_mod|xen_blkfront|hv_storvsc)"
+
   while IFS= read -r mod; do
     # Only add if not already in the list
     local found=0
@@ -144,8 +144,6 @@ detectInitrdKernelModules() {
 }
 
 # --- End feature detection helpers ---
-
-makeConf() {
 
 makeConf() {
   # Skip everything if main config already present
@@ -230,9 +228,8 @@ EOF
   # Only force-load nvme in initrd if NVMe hardware is actually present
   if [[ -d /sys/class/nvme ]]; then
     initrdKernelModules+=('"nvme"')
+  fi
   echo "nixos-infect: initrd kernelModules: ${initrdKernelModules[*]}"
-
-  # Detect LVM and generate appropriate config
 
   # Detect LVM and generate appropriate config
   local lvmcfg=""
@@ -274,9 +271,8 @@ EOF
       # Unknown hypervisor — don't assume qemu, rely on detected modules
       echo "nixos-infect: WARNING: unknown virtualization type '$virt', no guest profile imported"
       guest_profile="  # Unknown virtualization: $virt"
+      ;;
   esac
-
-  # Resolve root device to UUID if possible for more stable boot config
 
   # Resolve root device to UUID if possible for more stable boot config
   local rootfs_device_cfg
@@ -307,8 +303,9 @@ EOF
   echo "nixos-infect: generated hardware-configuration.nix:"
   cat /etc/nixos/hardware-configuration.nix
 
-  [[ -n "$doNetConf" ]] && makeNetworkingConf || true
 }
+
+makeLightsailConf() {
 
 makeLightsailConf() {
   mkdir -p /etc/nixos
