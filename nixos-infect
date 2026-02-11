@@ -13,7 +13,10 @@ autodetectProvider() {
 # --- Feature detection helpers ---
 
 detectVirtualization() {
-  # Returns: vmware, kvm, xen, hyperv, oracle, physical, or unknown
+  # Returns the detected virtualization type. Possible values include:
+  # vmware, kvm, qemu, microsoft, oracle, xen, none (bare metal),
+  # lxc, docker, openvz, systemd-nspawn, podman, wsl, or unknown.
+
   if command -v systemd-detect-virt &>/dev/null; then
     systemd-detect-virt 2>/dev/null || echo "unknown"
     return
@@ -106,14 +109,14 @@ detectStorageModules() {
 
   # Detect additional modules from currently loaded kernel modules
   # that are relevant to storage
-  local storage_pattern="(nvme|virtio_blk|virtio_scsi|virtio_pci|vmw_pvscsi|mptspi|mpt3sas|ahci|sd_mod|sr_mod|xen_blkfront|hv_storvsc)"
-
+  local storage_pattern="(nvme|virtio_blk|virtio_scsi|virtio_pci|vmw_pvscsi|mptspi|mpt3sas|megaraid_sas|aacraid|hpsa|ahci|sd_mod|sr_mod|xen_blkfront|hv_storvsc|hv_vmbus)"
   while IFS= read -r mod; do
     # Only add if not already in the list
     local found=0
     for existing in "${modules[@]}"; do
       [[ "$existing" == "$mod" ]] && found=1 && break
     done
+
     [[ $found -eq 0 ]] && modules+=("$mod")
   done < <(lsmod 2>/dev/null | awk 'NR>1 {print $1}' | grep -E "$storage_pattern" || true)
 
@@ -303,9 +306,8 @@ EOF
   echo "nixos-infect: generated hardware-configuration.nix:"
   cat /etc/nixos/hardware-configuration.nix
 
+  [[ -n "$doNetConf" ]] && makeNetworkingConf || true
 }
-
-makeLightsailConf() {
 
 makeLightsailConf() {
   mkdir -p /etc/nixos
@@ -313,6 +315,7 @@ makeLightsailConf() {
 { config, pkgs, modulesPath, lib, ... }:
 {
   imports = [ "\${modulesPath}/virtualisation/amazon-image.nix" ];
+
   boot.loader.grub.device = lib.mkForce "/dev/nvme0n1";
 }
 EOF
@@ -604,14 +607,14 @@ if [ ! -v PROVIDER ]; then
   autodetectProvider
 fi
 
-[ "$PROVIDER" = "digitalocean" ] && doNetConf=y # digitalocean requires detailed network config to be generated
 [ "$PROVIDER" = "lightsail" ] && newrootfslabel="nixos"
 if [[ "$PROVIDER" = "digitalocean" ]] || [[ "$PROVIDER" = "servarica" ]] || [[ "$PROVIDER" = "hetznercloud" ]]; then
-	doNetConf=y # some providers require detailed network config to be generated
+	doNetConf=y # these providers require detailed network config to be generated
 fi
 
 checkEnv
 prepareEnv
+
 checkExistingSwap
 if [[ -z "$NO_SWAP" ]]; then
     makeSwap # smallest (512MB) droplet needs extra memory!
