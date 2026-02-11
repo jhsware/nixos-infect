@@ -556,7 +556,9 @@ infect() {
   #addgroup nixbld -g 30000 || true
   #for i in {1..10}; do adduser -DH -G nixbld nixbld$i || true; done
   NIX_INSTALL_URL="${NIX_INSTALL_URL:-https://nixos.org/nix/install}"
-  curl -L "${NIX_INSTALL_URL}" | sh -s -- --no-channel-add
+  local nix_install_flags="--no-channel-add"
+  [[ -n "$NO_DAEMON" ]] && nix_install_flags="--no-daemon $nix_install_flags"
+  curl -L "${NIX_INSTALL_URL}" | sh -s -- $nix_install_flags
 
   # shellcheck disable=SC1090
   source ~/.nix-profile/etc/profile.d/nix.sh
