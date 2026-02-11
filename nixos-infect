@@ -238,7 +238,8 @@ EOF
   local lvmcfg=""
   if detectLVM; then
     echo "nixos-infect: LVM detected on root filesystem"
-    lvmcfg="  services.lvm.enable = true;"
+    lvmcfg="  services.lvm.enable = true;
+  boot.initrd.services.lvm.enable = true;"
   fi
 
   # Choose the appropriate guest profile/module based on virtualization.
@@ -277,16 +278,24 @@ EOF
       ;;
   esac
 
-  # Resolve root device to UUID if possible for more stable boot config
+  # Resolve root device path for NixOS config.
+  # For LVM, use the device-mapper path directly so NixOS knows to
+  # activate LVM (vgchange -ay) in the initrd before mounting root.
+  # For non-LVM, resolve to UUID for more stable boot config.
   local rootfs_device_cfg
-  local rootfs_uuid
-  rootfs_uuid=$(blkid -s UUID -o value "$rootfsdev" 2>/dev/null || true)
-  if [[ -n "$rootfs_uuid" ]]; then
-    rootfs_device_cfg="/dev/disk/by-uuid/$rootfs_uuid"
-    echo "nixos-infect: root device $rootfsdev resolved to UUID: $rootfs_uuid"
-  else
+  if detectLVM; then
     rootfs_device_cfg="$rootfsdev"
-    echo "nixos-infect: root device $rootfsdev (no UUID found, using device path)"
+    echo "nixos-infect: LVM root — using device path: $rootfs_device_cfg"
+  else
+    local rootfs_uuid
+    rootfs_uuid=$(blkid -s UUID -o value "$rootfsdev" 2>/dev/null || true)
+    if [[ -n "$rootfs_uuid" ]]; then
+      rootfs_device_cfg="/dev/disk/by-uuid/$rootfs_uuid"
+      echo "nixos-infect: root device $rootfsdev resolved to UUID: $rootfs_uuid"
+    else
+      rootfs_device_cfg="$rootfsdev"
+      echo "nixos-infect: root device $rootfsdev (no UUID found, using device path)"
+    fi
   fi
 
   # If you rerun this later, be sure to prune the filesSystems attr
