@@ -1575,6 +1575,22 @@ patch_configuration_nix() {
   sed -i '/networking\.useDHCP/d' "$CONF"
   sed -i '/services\.openssh\.enable/d' "$CONF"
   info "Removed conflicting networking/SSH lines from configuration.nix"
+
+  # Set networking.domain to first DNS search domain for proper FQDN
+  # (needed for Let's Encrypt ACME and other FQDN-dependent services)
+  if [[ ${#DNS_SEARCH_DOMAINS[@]} -gt 0 ]]; then
+    local NIXOS_DOMAIN="${DNS_SEARCH_DOMAINS[0]}"
+    if grep -q 'networking\.domain' "$CONF"; then
+      sed -i "s|networking\.domain = \"[^\"]*\";|networking.domain = \"${NIXOS_DOMAIN}\";|" "$CONF"
+      info "Set networking.domain = \"${NIXOS_DOMAIN}\" (from DNS search domain)"
+    else
+      # Add domain after hostName line if it doesn't exist
+      sed -i "/networking\.hostName/a\\  networking.domain = \"${NIXOS_DOMAIN}\";" "$CONF"
+      info "Added networking.domain = \"${NIXOS_DOMAIN}\" (from DNS search domain)"
+    fi
+  else
+    info "No DNS search domains detected — leaving networking.domain as-is"
+  fi
 }
 
 # Rebuild the NixOS system profile with corrected configs
@@ -1726,7 +1742,10 @@ main() {
       echo ""
       info "Step 4: Patch /etc/nixos/configuration.nix"
       detail "Add ./networking.nix to imports"
-      detail "Remove conflicting lines: networking.useDHCP, services.openssh.enable"
+    detail "Remove conflicting lines: networking.useDHCP, services.openssh.enable"
+    if [[ ${#DNS_SEARCH_DOMAINS[@]} -gt 0 ]]; then
+      detail "Set networking.domain = \"${DNS_SEARCH_DOMAINS[0]}\" (from DNS search domain)"
+    fi
       echo ""
       if $SWAP_IS_FILE; then
         info "Step 5: Preserve swap file through lustration"
