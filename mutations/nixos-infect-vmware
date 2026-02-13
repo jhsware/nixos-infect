@@ -618,7 +618,13 @@ detect_network_config() {
     while IFS= read -r line; do
       if [[ "$line" =~ DNS\ Domain:\ *(.*) ]]; then
         for dom in ${BASH_REMATCH[1]}; do
-          [[ -n "$dom" ]] && DNS_SEARCH_DOMAINS+=("$dom")
+          [[ -n "$dom" ]] || continue
+          # Deduplicate (same domain can appear on multiple links)
+          ALREADY=false
+          for existing in "${DNS_SEARCH_DOMAINS[@]:-}"; do
+            [[ "$existing" == "$dom" ]] && ALREADY=true && break
+          done
+          $ALREADY || DNS_SEARCH_DOMAINS+=("$dom")
         done
       fi
     done < <(resolvectl status 2>/dev/null)
