@@ -849,6 +849,126 @@ run_detection() {
 }
 
 # ===========================================================================
+# Pre-flight safety checks
+# ===========================================================================
+preflight_checks() {
+  section "Pre-flight Safety Checks"
+  local ERRORS=0
+  local WARNINGS=0
+
+  # 1. Verify we're on a VMware VM (warn if not, but allow for QEMU/KVM too)
+  if ! $IS_VMWARE && ! $IS_QEMU; then
+    warn "Not running on a recognized hypervisor (detected: ${VIRT_TYPE})"
+    warn "This script is optimized for VMware VMs. Proceed with caution."
+    WARNINGS=$((WARNINGS + 1))
+  fi
+  if $IS_VMWARE; then
+    info "VMware environment confirmed"
+  fi
+
+  # 2. Verify we have network connectivity (needed to download nixos-infect and Nix)
+  if [[ "$MODE" == "apply" ]]; then
+    if command -v curl &>/dev/null; then
+      if ! curl -s --max-time 5 -o /dev/null https://nixos.org 2>/dev/null; then
+        error "Cannot reach https://nixos.org — network connectivity required for apply mode"
+        ERRORS=$((ERRORS + 1))
+      else
+        info "Network connectivity confirmed"
+      fi
+    elif command -v wget &>/dev/null; then
+      if ! wget -q --timeout=5 -O /dev/null https://nixos.org 2>/dev/null; then
+        error "Cannot reach https://nixos.org — network connectivity required for apply mode"
+        ERRORS=$((ERRORS + 1))
+      else
+        info "Network connectivity confirmed"
+      fi
+    else
+      warn "Neither curl nor wget available — cannot verify network connectivity"
+      WARNINGS=$((WARNINGS + 1))
+    fi
+  fi
+
+  # 3. Verify sufficient disk space (nixos-infect needs several GB)
+  if [[ "$MODE" == "apply" ]]; then
+    ROOT_FREE_KB=$(df / --output=avail | tail -1 | tr -d ' ')
+    ROOT_FREE_MB=$((ROOT_FREE_KB / 1024))
+    if [[ $ROOT_FREE_MB -lt 2048 ]]; then
+      error "Insufficient disk space: ${ROOT_FREE_MB}MB free on /. Need at least 2048MB."
+      ERRORS=$((ERRORS + 1))
+    elif [[ $ROOT_FREE_MB -lt 4096 ]]; then
+      warn "Low disk space: ${ROOT_FREE_MB}MB free on /. Recommend at least 4096MB."
+      WARNINGS=$((WARNINGS + 1))
+    else
+      info "Disk space: ${ROOT_FREE_MB}MB free on /"
+    fi
+  fi
+
+  # 4. Verify SSH is running (critical for headless VMs)
+  if ! $SSH_RUNNING; then
+    warn "SSH is not running — you may lose access after conversion on a headless VM"
+    WARNINGS=$((WARNINGS + 1))
+  fi
+
+  # 5. Verify we have a primary network interface with an IP
+  if [[ -z "$PRIMARY_IFACE" ]]; then
+    error "No primary network interface detected"
+    ERRORS=$((ERRORS + 1))
+  elif [[ -z "${IFACE_IPV4[$PRIMARY_IFACE]:-}" ]]; then
+    warn "Primary interface ${PRIMARY_IFACE} has no IPv4 address"
+    WARNINGS=$((WARNINGS + 1))
+  else
+    info "Primary interface ${PRIMARY_IFACE} has IP: ${IFACE_IPV4[$PRIMARY_IFACE]}"
+  fi
+
+  # 6. Verify required tools are available
+  local REQUIRED_TOOLS=("findmnt" "ip" "lsmod" "awk" "sed" "grep")
+  for tool in "${REQUIRED_TOOLS[@]}"; do
+    if ! command -v "$tool" &>/dev/null; then
+      error "Required tool not found: ${tool}"
+      ERRORS=$((ERRORS + 1))
+    fi
+  done
+
+  if [[ "$MODE" == "apply" ]]; then
+    if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+      error "Neither curl nor wget found — needed to download nixos-infect"
+      ERRORS=$((ERRORS + 1))
+    fi
+  fi
+
+  # 7. LVM safety: verify we can actually see the LVM volumes
+  if $USES_LVM; then
+    if [[ -z "$LVM_VG" ]] || [[ -z "$LVM_LV" ]]; then
+      warn "LVM detected but could not identify root VG/LV — config may be incomplete"
+      WARNINGS=$((WARNINGS + 1))
+    else
+      info "LVM root: ${LVM_VG}/${LVM_LV} — dm_mod and lvm services will be configured"
+    fi
+  fi
+
+  # 8. BIOS boot: verify we found a GRUB device
+  if ! $IS_EFI && [[ -z "$GRUB_DEV" ]]; then
+    error "BIOS boot mode but no GRUB device found (checked /dev/sda, /dev/vda, /dev/nvme0n1)"
+    ERRORS=$((ERRORS + 1))
+  fi
+
+  # Summary
+  echo ""
+  if [[ $ERRORS -gt 0 ]]; then
+    error "Pre-flight check failed: ${ERRORS} error(s), ${WARNINGS} warning(s)"
+    if [[ "$MODE" == "apply" ]]; then
+      error "Aborting apply mode due to errors. Fix the issues and retry."
+      error "Use --mode inspect to see what would be generated despite errors."
+      exit 1
+    fi
+  elif [[ $WARNINGS -gt 0 ]]; then
+    warn "Pre-flight check passed with ${WARNINGS} warning(s)"
+  else
+    info "All pre-flight checks passed"
+  fi
+}
+
+# ===========================================================================
 # Config generation — hardware-configuration.nix
 # ===========================================================================
 generate_hardware_config() {
@@ -1321,6 +1441,9 @@ main() {
 
   # Run detection
   run_detection
+
+  # Pre-flight safety checks (blocks apply mode on errors)
+  preflight_checks
 
   # Generate configs
   generate_hardware_config
