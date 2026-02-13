@@ -1375,16 +1375,17 @@ pre_cleanup_nixos_configs() {
     local basename
     basename=$(basename "$nixfile")
     cp "$nixfile" "$BACKUP_DIR/"
-    # Remove networking.nix entirely — we'll regenerate it
-    # Remove hardware-configuration.nix — nixos-infect will regenerate it
+    # Remove networking.nix entirely — we'll regenerate it in replace_configs()
+    # Keep hardware-configuration.nix — nixos-infect needs it for the build
     # Keep configuration.nix but strip the networking.nix import to prevent
     # it from pulling in the (now removed) networking.nix during build
-    if [[ "$basename" == "networking.nix" ]] || [[ "$basename" == "hardware-configuration.nix" ]]; then
+    if [[ "$basename" == "networking.nix" ]]; then
       rm -f "$nixfile"
       info "Removed stale $basename (backed up to $BACKUP_DIR/)"
       CLEANED=true
     fi
   done
+
 
   # Strip networking.nix import from configuration.nix if it exists
   if [[ -f /etc/nixos/configuration.nix ]]; then
@@ -1599,7 +1600,8 @@ main() {
       section "Dry Run — Planned Actions"
       echo ""
       info "Step 0: Pre-cleanup stale NixOS configs (if re-provisioning)"
-      detail "Remove old networking.nix and hardware-configuration.nix"
+      detail "Remove old networking.nix (keep hardware-configuration.nix for nixos-infect)"
+
       detail "Strip networking.nix import from configuration.nix"
       detail "Back up removed files to /etc/nixos/pre-cleanup-TIMESTAMP/"
       echo ""
