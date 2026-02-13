@@ -1,0 +1,1338 @@
+#!/usr/bin/env bash
+# inspect-for-nixos.sh — Inspect a VMware Ubuntu VM for NixOS conversion via nixos-infect
+#
+# Run as root on the target machine before running nixos-infect.
+# Produces suggested hardware-configuration.nix and networking.nix content
+# with explanations and warnings.
+#
+# Target: NixOS 25.05+
+
+set -euo pipefail
+
+# ===========================================================================
+# Colors and helpers
+# ===========================================================================
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+info()    { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
+error()   { echo -e "${RED}[ERROR]${NC} $*"; }
+section() { echo -e "\n${BOLD}${CYAN}═══ $* ═══${NC}"; }
+detail()  { echo -e "  ${DIM}→${NC} $*"; }
+
+# ===========================================================================
+# Root check
+# ===========================================================================
+if [[ "$(id -u)" -ne 0 ]]; then
+  error "This script must be run as root"
+  exit 1
+fi
+
+# ===========================================================================
+# 1. Gather system facts
+# ===========================================================================
+section "System Detection"
+
+ARCH=$(uname -m)
+info "Architecture: ${ARCH}"
+
+# --- Virtualisation / hypervisor -------------------------------------------
+VIRT_TYPE="unknown"
+if command -v systemd-detect-virt &>/dev/null; then
+  VIRT_TYPE=$(systemd-detect-virt 2>/dev/null || echo "unknown")
+fi
+# Fallback: check DMI
+if [[ "$VIRT_TYPE" == "unknown" ]] && [[ -r /sys/class/dmi/id/sys_vendor ]]; then
+  SYS_VENDOR=$(cat /sys/class/dmi/id/sys_vendor)
+  case "$SYS_VENDOR" in
+    *VMware*) VIRT_TYPE="vmware" ;;
+    *QEMU*)   VIRT_TYPE="qemu"   ;;
+    *Xen*)    VIRT_TYPE="xen"    ;;
+    *)        VIRT_TYPE="unknown ($SYS_VENDOR)" ;;
+  esac
+fi
+info "Virtualisation: ${VIRT_TYPE}"
+
+IS_VMWARE=false
+IS_QEMU=false
+if [[ "$VIRT_TYPE" == *"vmware"* ]]; then
+  IS_VMWARE=true
+  info "VMware detected — will include VMware-specific modules"
+elif [[ "$VIRT_TYPE" == *"qemu"* ]] || [[ "$VIRT_TYPE" == *"kvm"* ]]; then
+  IS_QEMU=true
+  info "QEMU/KVM detected"
+fi
+
+# --- EFI vs BIOS -----------------------------------------------------------
+IS_EFI=false
+if [[ -d /sys/firmware/efi ]]; then
+  IS_EFI=true
+  info "Boot mode: EFI"
+else
+  info "Boot mode: Legacy BIOS"
+fi
+
+# --- Root filesystem -------------------------------------------------------
+ROOT_DEV=$(findmnt -n -o SOURCE /)
+ROOT_FSTYPE=$(findmnt -n -o FSTYPE /)
+info "Root device: ${ROOT_DEV} (${ROOT_FSTYPE})"
+
+# --- Check for LVM ---------------------------------------------------------
+USES_LVM=false
+LVM_VG=""
+LVM_LV=""
+
+# Collect all LVM logical volumes with their details
+declare -A LVM_LV_VG=()       # lv_dm_path -> vg_name
+declare -A LVM_LV_NAME=()     # lv_dm_path -> lv_name
+declare -A LVM_LV_SIZE=()     # lv_dm_path -> lv_size
+
+if command -v lvs &>/dev/null && lvs &>/dev/null 2>&1; then
+  LV_COUNT=$(lvs --noheadings 2>/dev/null | wc -l)
+  if [[ "$LV_COUNT" -gt 0 ]]; then
+    USES_LVM=true
+
+    # Parse all LVs
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      local_vg=$(echo "$line" | awk '{print $1}')
+      local_lv=$(echo "$line" | awk '{print $2}')
+      local_size=$(echo "$line" | awk '{print $3}')
+      local_dmpath=$(echo "$line" | awk '{print $4}')
+      LVM_LV_VG["$local_dmpath"]="$local_vg"
+      LVM_LV_NAME["$local_dmpath"]="$local_lv"
+      LVM_LV_SIZE["$local_dmpath"]="$local_size"
+    done < <(lvs --noheadings -o vg_name,lv_name,lv_size,lv_dm_path 2>/dev/null)
+
+    # Identify root LV
+    if [[ "$ROOT_DEV" == /dev/mapper/* ]] || [[ "$ROOT_DEV" == /dev/dm-* ]]; then
+      ROOT_DEV_RESOLVED_TMP=$(readlink -f "$ROOT_DEV" 2>/dev/null || echo "$ROOT_DEV")
+      for dmpath in "${!LVM_LV_VG[@]}"; do
+        RESOLVED_LV=$(readlink -f "$dmpath" 2>/dev/null || echo "$dmpath")
+        if [[ "$ROOT_DEV_RESOLVED_TMP" == "$RESOLVED_LV" ]]; then
+          LVM_VG="${LVM_LV_VG[$dmpath]}"
+          LVM_LV="${LVM_LV_NAME[$dmpath]}"
+          break
+        fi
+      done
+    fi
+    info "LVM detected — VG: ${LVM_VG:-unknown}, LV: ${LVM_LV:-unknown}"
+    warn "LVM requires dm_mod and lvm2 in initrd — this is the #1 cause of nixos-infect boot failures!"
+  fi
+else
+  info "LVM: not detected"
+fi
+
+# --- Detect ALL mounted LVM volumes and non-root mounts --------------------
+declare -A EXTRA_MOUNTS=()       # mountpoint -> device
+declare -A EXTRA_MOUNT_FS=()     # mountpoint -> fstype
+declare -A EXTRA_MOUNT_IS_LVM=() # mountpoint -> true/false
+
+if $USES_LVM; then
+  detail "All logical volumes:"
+  for dmpath in "${!LVM_LV_VG[@]}"; do
+    detail "  ${LVM_LV_VG[$dmpath]}/${LVM_LV_NAME[$dmpath]} ${LVM_LV_SIZE[$dmpath]} ${dmpath}"
+  done
+fi
+
+# Scan all mounts for non-root, non-boot, non-special filesystems.
+# Uses --pairs (-P) output to safely handle paths with spaces.
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+
+  # Parse KEY="VALUE" pairs from findmnt --pairs output
+  MT_SOURCE="" MT_TARGET="" MT_FSTYPE=""
+  [[ "$line" =~ SOURCE=\"([^\"]*)\" ]] && MT_SOURCE="${BASH_REMATCH[1]}"
+  [[ "$line" =~ TARGET=\"([^\"]*)\" ]] && MT_TARGET="${BASH_REMATCH[1]}"
+  [[ "$line" =~ FSTYPE=\"([^\"]*)\" ]] && MT_FSTYPE="${BASH_REMATCH[1]}"
+
+  # Skip if we failed to parse
+  [[ -z "$MT_TARGET" ]] && continue
+
+  # Skip root, boot, and virtual/special filesystems
+  [[ "$MT_TARGET" == "/" ]] && continue
+  [[ "$MT_TARGET" == "/boot" ]] && continue
+  [[ "$MT_TARGET" == /boot/* ]] && continue
+  [[ "$MT_TARGET" == /snap/* ]] && continue
+  [[ "$MT_TARGET" == /sys/* ]] && continue
+  [[ "$MT_TARGET" == /proc/* ]] && continue
+  [[ "$MT_TARGET" == /dev/* ]] && continue
+  [[ "$MT_TARGET" == /run/* ]] && continue
+  [[ "$MT_FSTYPE" == "tmpfs" ]] && continue
+  [[ "$MT_FSTYPE" == "devtmpfs" ]] && continue
+  [[ "$MT_FSTYPE" == "sysfs" ]] && continue
+  [[ "$MT_FSTYPE" == "proc" ]] && continue
+  [[ "$MT_FSTYPE" == "cgroup"* ]] && continue
+  [[ "$MT_FSTYPE" == "securityfs" ]] && continue
+  [[ "$MT_FSTYPE" == "pstore" ]] && continue
+  [[ "$MT_FSTYPE" == "efivarfs" ]] && continue
+  [[ "$MT_FSTYPE" == "bpf" ]] && continue
+  [[ "$MT_FSTYPE" == "tracefs" ]] && continue
+  [[ "$MT_FSTYPE" == "debugfs" ]] && continue
+  [[ "$MT_FSTYPE" == "hugetlbfs" ]] && continue
+  [[ "$MT_FSTYPE" == "mqueue" ]] && continue
+  [[ "$MT_FSTYPE" == "fusectl" ]] && continue
+  [[ "$MT_FSTYPE" == "configfs" ]] && continue
+  [[ "$MT_FSTYPE" == "fuse."* ]] && continue
+  [[ "$MT_FSTYPE" == "squashfs" ]] && continue
+  [[ "$MT_FSTYPE" == "nsfs" ]] && continue
+  [[ "$MT_FSTYPE" == "overlay" ]] && continue
+
+  EXTRA_MOUNTS["$MT_TARGET"]="$MT_SOURCE"
+  EXTRA_MOUNT_FS["$MT_TARGET"]="$MT_FSTYPE"
+
+  # Check if this is an LVM device
+  IS_LVM_MOUNT=false
+  if [[ "$MT_SOURCE" == /dev/mapper/* ]] || [[ "$MT_SOURCE" == /dev/dm-* ]]; then
+    IS_LVM_MOUNT=true
+  fi
+  EXTRA_MOUNT_IS_LVM["$MT_TARGET"]="$IS_LVM_MOUNT"
+done < <(findmnt -Pn -o SOURCE,TARGET,FSTYPE 2>/dev/null)
+
+# Check if any extra mounts are network filesystems (NFS, CIFS, etc.)
+USES_NFS=false
+USES_NET_FS=false
+for mp in "${!EXTRA_MOUNT_FS[@]}"; do
+  case "${EXTRA_MOUNT_FS[$mp]}" in
+    nfs|nfs4)                                    USES_NFS=true; USES_NET_FS=true ;;
+    cifs|smb|smbfs|glusterfs|ceph|lustre)        USES_NET_FS=true ;;
+  esac
+done
+
+if [[ ${#EXTRA_MOUNTS[@]} -gt 0 ]]; then
+  info "Additional mounted filesystems:"
+  for mp in "${!EXTRA_MOUNTS[@]}"; do
+    IS_LVM_TAG=""
+    [[ "${EXTRA_MOUNT_IS_LVM[$mp]}" == "true" ]] && IS_LVM_TAG=" [LVM]"
+    detail "${mp} ← ${EXTRA_MOUNTS[$mp]} (${EXTRA_MOUNT_FS[$mp]})${IS_LVM_TAG}"
+  done
+  $USES_NFS && info "NFS mounts detected — will enable NFS client support"
+fi
+
+# --- Swap detection --------------------------------------------------------
+SWAP_DEVS=()
+SWAP_IS_LVM=false
+SWAP_IS_FILE=false
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  SWAP_DEVS+=("$line")
+  if [[ "$line" == /dev/mapper/* ]] || [[ "$line" == /dev/dm-* ]]; then
+    SWAP_IS_LVM=true
+  elif [[ "$line" == /* ]] && [[ ! "$line" == /dev/* ]]; then
+    SWAP_IS_FILE=true
+  fi
+done < <(swapon --show=NAME --noheadings 2>/dev/null || true)
+
+if [[ ${#SWAP_DEVS[@]} -gt 0 ]]; then
+  info "Swap devices: ${SWAP_DEVS[*]}"
+  $SWAP_IS_LVM && detail "Swap is on LVM"
+  $SWAP_IS_FILE && detail "Swap is a file (on root filesystem)"
+else
+  info "No swap devices found"
+fi
+
+# Detect total RAM for swap recommendations
+TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+TOTAL_RAM_MB=$((TOTAL_RAM_KB / 1024))
+info "Total RAM: ${TOTAL_RAM_MB} MB"
+
+# --- SSH detection ---------------------------------------------------------
+SSH_RUNNING=false
+if systemctl is-active sshd &>/dev/null || systemctl is-active ssh &>/dev/null; then
+  SSH_RUNNING=true
+  info "SSH server: running"
+else
+  warn "SSH server: not running — verify you have console access for recovery"
+fi
+
+# --- Boot partition / ESP --------------------------------------------------
+BOOT_DEV=""
+BOOT_FSTYPE=""
+BOOT_UUID=""
+BOOT_IS_SEPARATE=false
+
+if $IS_EFI; then
+  # EFI: look for ESP at /boot/efi, /boot/EFI, or /boot
+  for mp in /boot/efi /boot/EFI /boot; do
+    if mountpoint -q "$mp" 2>/dev/null; then
+      BOOT_DEV=$(findmnt -n -o SOURCE "$mp")
+      BOOT_FSTYPE=$(findmnt -n -o FSTYPE "$mp")
+      BOOT_IS_SEPARATE=true
+      for uuid_link in /dev/disk/by-uuid/*; do
+        if [[ "$(readlink -f "$uuid_link")" == "$(readlink -f "$BOOT_DEV")" ]]; then
+          BOOT_UUID="$uuid_link"
+          break
+        fi
+      done
+      break
+    fi
+  done
+  info "ESP: ${BOOT_DEV} (${BOOT_FSTYPE}) → ${BOOT_UUID:-no UUID found}"
+else
+  # BIOS: check if /boot is a separate partition (common with LVM root)
+  if mountpoint -q /boot 2>/dev/null; then
+    BOOT_DEV=$(findmnt -n -o SOURCE /boot)
+    BOOT_FSTYPE=$(findmnt -n -o FSTYPE /boot)
+    BOOT_IS_SEPARATE=true
+    for uuid_link in /dev/disk/by-uuid/*; do
+      if [[ "$(readlink -f "$uuid_link")" == "$(readlink -f "$BOOT_DEV")" ]]; then
+        BOOT_UUID="$uuid_link"
+        break
+      fi
+    done
+    info "Separate /boot partition: ${BOOT_DEV} (${BOOT_FSTYPE}) → ${BOOT_UUID:-no UUID found}"
+  fi
+fi
+
+# --- GRUB device for BIOS boot --------------------------------------------
+GRUB_DEV=""
+if ! $IS_EFI; then
+  for dev in /dev/sda /dev/vda /dev/xvda /dev/nvme0n1; do
+    if [[ -e "$dev" ]]; then
+      GRUB_DEV="$dev"
+      break
+    fi
+  done
+  info "GRUB device (BIOS): ${GRUB_DEV}"
+fi
+
+# --- Disk controllers (loaded kernel modules) ------------------------------
+section "Storage Controller Detection"
+
+LOADED_STORAGE_MODULES=()
+AVAILABLE_INITRD_MODULES=()
+
+# Check for specific VMware/virtio/common storage modules
+declare -A STORAGE_MODULE_DESC=(
+  ["vmw_pvscsi"]="VMware Paravirtual SCSI"
+  ["mptspi"]="LSI Logic SAS/SCSI (VMware default)"
+  ["mpt3sas"]="LSI Logic Fusion-MPT SAS-3"
+  ["virtio_blk"]="VirtIO block device"
+  ["virtio_scsi"]="VirtIO SCSI"
+  ["ahci"]="AHCI SATA controller"
+  ["ata_piix"]="legacy PIIX PATA/SATA"
+  ["nvme"]="NVMe storage"
+  ["sd_mod"]="SCSI disk support"
+  ["sr_mod"]="SCSI CD-ROM"
+  ["dm_mod"]="Device mapper (required for LVM)"
+  ["dm_snapshot"]="Device mapper snapshot"
+  ["dm_mirror"]="Device mapper mirror"
+)
+
+for mod in "${!STORAGE_MODULE_DESC[@]}"; do
+  if lsmod | grep -qw "$mod"; then
+    LOADED_STORAGE_MODULES+=("$mod")
+    info "Loaded: ${mod} — ${STORAGE_MODULE_DESC[$mod]}"
+  fi
+done
+
+# Detect actual disk controllers via /sys
+detail "Block devices and their drivers:"
+for blkdev in /sys/block/sd* /sys/block/nvme* /sys/block/vd* /sys/block/hd*; do
+  [[ -e "$blkdev" ]] || continue
+  DEV_NAME=$(basename "$blkdev")
+  DRIVER=""
+  if [[ -L "${blkdev}/device/driver" ]]; then
+    DRIVER=$(basename "$(readlink -f "${blkdev}/device/driver")")
+  fi
+  detail "  /dev/${DEV_NAME} → driver: ${DRIVER:-unknown}"
+done
+
+# --- Network adapter detection ---------------------------------------------
+section "Network Adapter Detection"
+
+NET_MODULES=()
+declare -A NET_MODULE_DESC=(
+  ["vmxnet3"]="VMware VMXNET3 paravirtual NIC"
+  ["e1000"]="Intel E1000 (VMware compatible)"
+  ["e1000e"]="Intel E1000e"
+  ["virtio_net"]="VirtIO network"
+)
+
+for mod in "${!NET_MODULE_DESC[@]}"; do
+  if lsmod | grep -qw "$mod"; then
+    NET_MODULES+=("$mod")
+    info "Loaded: ${mod} — ${NET_MODULE_DESC[$mod]}"
+  fi
+done
+
+# Also check via ethtool/driver for each interface
+for iface in /sys/class/net/*; do
+  IFACE_NAME=$(basename "$iface")
+  [[ "$IFACE_NAME" == "lo" ]] && continue
+  DRIVER=""
+  if [[ -L "${iface}/device/driver" ]]; then
+    DRIVER=$(basename "$(readlink -f "${iface}/device/driver")")
+  fi
+  MAC=$(cat "${iface}/address" 2>/dev/null || echo "unknown")
+  STATE=$(cat "${iface}/operstate" 2>/dev/null || echo "unknown")
+  detail "${IFACE_NAME}: driver=${DRIVER:-unknown}, mac=${MAC}, state=${STATE}"
+done
+
+# --- VMware-specific modules -----------------------------------------------
+if $IS_VMWARE; then
+  section "VMware-Specific Module Detection"
+  VMWARE_MODULES=("vmw_balloon" "vmw_vmci" "vmwgfx" "vmw_vsock_vmci_transport" "vmxnet3" "vmw_pvscsi")
+  for mod in "${VMWARE_MODULES[@]}"; do
+    if lsmod | grep -qw "$mod"; then
+      info "Loaded: ${mod}"
+    else
+      detail "Not loaded: ${mod}"
+    fi
+  done
+fi
+
+# --- Network configuration details ----------------------------------------
+section "Network Configuration"
+
+# ---- DNS: resolve real upstream servers via resolvectl ---------------------
+NAMESERVERS=()
+RESOLVECTL_AVAILABLE=false
+
+if command -v resolvectl &>/dev/null; then
+  RESOLVECTL_AVAILABLE=true
+  # Parse per-link DNS servers from resolvectl status
+  while IFS= read -r line; do
+    # Capture "DNS Servers:" lines (may have multiple servers)
+    if [[ "$line" =~ DNS\ Servers?:\ *(.*) ]]; then
+      DNS_VAL="${BASH_REMATCH[1]}"
+      for srv in $DNS_VAL; do
+        # Skip stub resolver and localhost
+        case "$srv" in
+          127.0.0.53|127.0.0.1|::1) continue ;;
+        esac
+        # Deduplicate
+        ALREADY=false
+        for existing in "${NAMESERVERS[@]:-}"; do
+          [[ "$existing" == "$srv" ]] && ALREADY=true && break
+        done
+        $ALREADY || NAMESERVERS+=("$srv")
+      done
+    fi
+  done < <(resolvectl status 2>/dev/null)
+  if [[ ${#NAMESERVERS[@]} -gt 0 ]]; then
+    info "DNS (from resolvectl): ${NAMESERVERS[*]}"
+  else
+    warn "resolvectl found no upstream DNS servers"
+  fi
+fi
+
+# Fallback: parse /etc/resolv.conf if resolvectl gave us nothing
+if [[ ${#NAMESERVERS[@]} -eq 0 ]]; then
+  while IFS= read -r ns; do
+    case "$ns" in
+      127.0.0.53|127.0.0.1|::1) continue ;;  # skip stub resolver
+    esac
+    NAMESERVERS+=("$ns")
+  done < <(grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | sort -u)
+
+  if [[ ${#NAMESERVERS[@]} -eq 0 ]]; then
+    warn "No real nameservers found — falling back to 8.8.8.8 + 1.1.1.1"
+    NAMESERVERS=("8.8.8.8" "1.1.1.1")
+  else
+    info "DNS (from resolv.conf): ${NAMESERVERS[*]}"
+  fi
+fi
+
+# ---- DNS domain (from resolvectl or hostname) -----------------------------
+DNS_SEARCH_DOMAINS=()
+if $RESOLVECTL_AVAILABLE; then
+  while IFS= read -r line; do
+    if [[ "$line" =~ DNS\ Domain:\ *(.*) ]]; then
+      for dom in ${BASH_REMATCH[1]}; do
+        [[ -n "$dom" ]] && DNS_SEARCH_DOMAINS+=("$dom")
+      done
+    fi
+  done < <(resolvectl status 2>/dev/null)
+  if [[ ${#DNS_SEARCH_DOMAINS[@]} -gt 0 ]]; then
+    info "DNS search domains: ${DNS_SEARCH_DOMAINS[*]}"
+  fi
+fi
+
+# ---- Pre-parse netplan DHCP settings via python3 (reliable) ---------------
+# python3-yaml is a default package on Ubuntu 20.04+. If available, we use
+# proper YAML parsing instead of fragile grep-based heuristics.
+declare -A NETPLAN_DHCP=()   # iface -> "true" if netplan says dhcp4
+DHCP_DETECT_CONFIDENT=true
+
+if command -v python3 &>/dev/null && python3 -c "import yaml" 2>/dev/null; then
+  while IFS= read -r iface_name; do
+    [[ -n "$iface_name" ]] && NETPLAN_DHCP["$iface_name"]=true
+  done < <(python3 -c "
+import yaml, glob
+for f in sorted(glob.glob('/etc/netplan/*.yaml') + glob.glob('/etc/netplan/*.yml')):
+    try:
+        with open(f) as fh:
+            data = yaml.safe_load(fh)
+        if not data or 'network' not in data:
+            continue
+        for iface, cfg in data['network'].get('ethernets', {}).items():
+            if cfg and cfg.get('dhcp4') in (True, 'yes', 'true'):
+                print(iface)
+    except Exception:
+        pass
+" 2>/dev/null)
+  info "DHCP detection: python3-yaml (high confidence)"
+else
+  DHCP_DETECT_CONFIDENT=false
+  warn "DHCP detection: python3-yaml not available, falling back to grep (low confidence)"
+fi
+
+# ---- Collect per-interface network details ---------------------------------
+declare -A IFACE_MAC=()
+declare -A IFACE_IPV4=()       # newline-separated CIDR addresses
+declare -A IFACE_IPV6=()       # newline-separated CIDR addresses
+declare -A IFACE_GATEWAY4=()
+declare -A IFACE_GATEWAY6=()
+declare -A IFACE_DRIVER=()
+declare -A IFACE_STATE=()
+declare -A IFACE_HAS_DEFAULT_ROUTE=()
+declare -A IFACE_DHCP=()
+
+ALL_IFACES=()
+PRIMARY_IFACE=""
+
+for iface_path in /sys/class/net/*; do
+  IFACE_NAME=$(basename "$iface_path")
+  [[ "$IFACE_NAME" == "lo" ]] && continue
+  ALL_IFACES+=("$IFACE_NAME")
+
+  IFACE_MAC["$IFACE_NAME"]=$(cat "${iface_path}/address" 2>/dev/null || echo "")
+  IFACE_STATE["$IFACE_NAME"]=$(cat "${iface_path}/operstate" 2>/dev/null || echo "unknown")
+
+  DRIVER=""
+  if [[ -L "${iface_path}/device/driver" ]]; then
+    DRIVER=$(basename "$(readlink -f "${iface_path}/device/driver")")
+  fi
+  IFACE_DRIVER["$IFACE_NAME"]="$DRIVER"
+
+  # IPv4 addresses (CIDR)
+  IFACE_IPV4["$IFACE_NAME"]=$(ip -4 addr show dev "$IFACE_NAME" 2>/dev/null \
+    | grep 'inet ' | awk '{print $2}' || true)
+
+  # IPv6 addresses (CIDR)
+  IFACE_IPV6["$IFACE_NAME"]=$(ip -6 addr show dev "$IFACE_NAME" 2>/dev/null \
+    | grep 'inet6 ' | awk '{print $2}' || true)
+
+  # Default gateway via this interface?
+  GW4=$(ip -4 route show default dev "$IFACE_NAME" 2>/dev/null | awk '/default/{print $3}' | head -1 || true)
+  GW6=$(ip -6 route show default dev "$IFACE_NAME" 2>/dev/null | awk '/default/{print $3}' | head -1 || true)
+  IFACE_GATEWAY4["$IFACE_NAME"]="$GW4"
+  IFACE_GATEWAY6["$IFACE_NAME"]="$GW6"
+
+  HAS_DEFAULT=false
+  [[ -n "$GW4" ]] && HAS_DEFAULT=true
+  IFACE_HAS_DEFAULT_ROUTE["$IFACE_NAME"]="$HAS_DEFAULT"
+
+  # Pick primary as the one with a default route
+  if $HAS_DEFAULT && [[ -z "$PRIMARY_IFACE" ]]; then
+    PRIMARY_IFACE="$IFACE_NAME"
+  fi
+
+  # Per-interface DHCP detection
+  IFACE_IS_DHCP=false
+
+  # Method 1: python3-parsed netplan (high confidence)
+  if [[ -n "${NETPLAN_DHCP[$IFACE_NAME]+x}" ]]; then
+    IFACE_IS_DHCP=true
+  elif ! $DHCP_DETECT_CONFIDENT; then
+    # Method 1b: grep-based netplan fallback (low confidence)
+    for f in /etc/netplan/*.yaml /etc/netplan/*.yml; do
+      [[ -r "$f" ]] || continue
+      if grep -A5 "$IFACE_NAME" "$f" 2>/dev/null | grep -q "dhcp4: true\|dhcp4: yes"; then
+        IFACE_IS_DHCP=true
+      fi
+    done
+  fi
+  # Method 2: networkctl (works with systemd-networkd)
+  if ! $IFACE_IS_DHCP && command -v networkctl &>/dev/null; then
+    if networkctl status "$IFACE_NAME" 2>/dev/null | grep -qi "DHCP4: yes\|DHCPv4"; then
+      IFACE_IS_DHCP=true
+    fi
+  fi
+  # Method 3: dhclient lease files
+  if ! $IFACE_IS_DHCP && [[ -f "/var/lib/dhcp/dhclient.${IFACE_NAME}.leases" ]]; then
+    IFACE_IS_DHCP=true
+  fi
+  IFACE_DHCP["$IFACE_NAME"]="$IFACE_IS_DHCP"
+done
+
+# Fallback: first non-lo interface
+if [[ -z "$PRIMARY_IFACE" ]] && [[ ${#ALL_IFACES[@]} -gt 0 ]]; then
+  PRIMARY_IFACE="${ALL_IFACES[0]}"
+fi
+
+PRIMARY_MAC="${IFACE_MAC[$PRIMARY_IFACE]:-}"
+
+info "Primary interface: ${PRIMARY_IFACE} (has default route)"
+
+for iface in "${ALL_IFACES[@]}"; do
+  ROLE="secondary"
+  [[ "$iface" == "$PRIMARY_IFACE" ]] && ROLE="primary"
+  detail "${iface} [${ROLE}]: mac=${IFACE_MAC[$iface]}, state=${IFACE_STATE[$iface]}, driver=${IFACE_DRIVER[$iface]}"
+  if [[ -n "${IFACE_IPV4[$iface]}" ]]; then
+    while IFS= read -r addr; do
+      [[ -z "$addr" ]] && continue
+      detail "  IPv4: ${addr}"
+    done <<< "${IFACE_IPV4[$iface]}"
+  else
+    detail "  IPv4: none"
+  fi
+  if [[ -n "${IFACE_IPV6[$iface]}" ]]; then
+    while IFS= read -r addr; do
+      [[ -z "$addr" ]] && continue
+      detail "  IPv6: ${addr}"
+    done <<< "${IFACE_IPV6[$iface]}"
+  else
+    detail "  IPv6: none"
+  fi
+  [[ -n "${IFACE_GATEWAY4[$iface]}" ]] && detail "  Gateway4: ${IFACE_GATEWAY4[$iface]}"
+  [[ -n "${IFACE_GATEWAY6[$iface]}" ]] && detail "  Gateway6: ${IFACE_GATEWAY6[$iface]}"
+  detail "  DHCP: ${IFACE_DHCP[$iface]}"
+done
+
+# Overall DHCP flag (for primary interface)
+USES_DHCP="${IFACE_DHCP[$PRIMARY_IFACE]:-false}"
+info "Primary interface uses DHCP: ${USES_DHCP}"
+
+# Collect secondary interfaces
+SECONDARY_IFACES=()
+for iface in "${ALL_IFACES[@]}"; do
+  [[ "$iface" == "$PRIMARY_IFACE" ]] && continue
+  SECONDARY_IFACES+=("$iface")
+done
+if [[ ${#SECONDARY_IFACES[@]} -gt 0 ]]; then
+  info "Secondary interfaces: ${SECONDARY_IFACES[*]}"
+fi
+
+# Check if interface names are predictable
+USES_PREDICTABLE_NAMES=true
+if [[ "$PRIMARY_IFACE" == eth* ]]; then
+  USES_PREDICTABLE_NAMES=false
+fi
+
+# ===========================================================================
+# 2. Build the initrd kernel modules list
+# ===========================================================================
+section "Building Kernel Module Lists"
+
+INITRD_AVAILABLE=()
+INITRD_KERNEL=()
+
+# Storage modules that should be in availableKernelModules
+INITRD_AVAILABLE+=("ata_piix")       # Legacy PIIX — generally safe to include
+INITRD_AVAILABLE+=("uhci_hcd")       # USB host controller
+INITRD_AVAILABLE+=("sd_mod")         # SCSI disk
+
+if $IS_VMWARE; then
+  INITRD_AVAILABLE+=("vmw_pvscsi")   # VMware paravirtual SCSI
+  INITRD_AVAILABLE+=("mptspi")       # LSI Logic (VMware default SCSI)
+  INITRD_AVAILABLE+=("ahci")         # SATA/AHCI
+fi
+
+# Check for NVMe
+if [[ -e /sys/block/nvme0n1 ]] || lsmod | grep -qw nvme; then
+  INITRD_KERNEL+=("nvme")
+fi
+
+# LVM: critical for Ubuntu default installs
+if $USES_LVM; then
+  INITRD_KERNEL+=("dm_mod")          # Device mapper core
+  INITRD_KERNEL+=("dm_snapshot")     # DM snapshot (often needed)
+fi
+
+info "initrd.availableKernelModules: ${INITRD_AVAILABLE[*]}"
+info "initrd.kernelModules: ${INITRD_KERNEL[*]}"
+
+# Boot kernel modules (loaded at runtime, not initrd)
+# For VMware, unconditionally include these — they're always needed regardless
+# of whether they happen to be loaded on the source OS.
+BOOT_KERNEL_MODULES=()
+if $IS_VMWARE; then
+  BOOT_KERNEL_MODULES+=("vmw_balloon" "vmw_vmci" "vmxnet3")
+fi
+info "boot.kernelModules: ${BOOT_KERNEL_MODULES[*]}"
+
+
+# ===========================================================================
+# 3. Detect root device path — prefer /dev/disk/by-uuid or /dev/disk/by-id
+# ===========================================================================
+section "Root Device Resolution"
+
+ROOT_DEV_RESOLVED=$(readlink -f "$ROOT_DEV")
+ROOT_BY_UUID=""
+ROOT_BY_ID=""
+
+for uuid_link in /dev/disk/by-uuid/*; do
+  [[ -e "$uuid_link" ]] || continue
+  if [[ "$(readlink -f "$uuid_link")" == "$ROOT_DEV_RESOLVED" ]]; then
+    ROOT_BY_UUID="$uuid_link"
+    break
+  fi
+done
+
+for id_link in /dev/disk/by-id/*; do
+  [[ -e "$id_link" ]] || continue
+  if [[ "$(readlink -f "$id_link")" == "$ROOT_DEV_RESOLVED" ]]; then
+    ROOT_BY_ID="$id_link"
+    break
+  fi
+done
+
+info "Root resolved: ${ROOT_DEV_RESOLVED}"
+[[ -n "$ROOT_BY_UUID" ]] && info "Root by-uuid: ${ROOT_BY_UUID}"
+[[ -n "$ROOT_BY_ID" ]]   && info "Root by-id:   ${ROOT_BY_ID}"
+
+# For LVM, the proper NixOS device path
+ROOT_NIX_DEV="$ROOT_DEV"
+if $USES_LVM; then
+  if [[ -n "$LVM_VG" ]] && [[ -n "$LVM_LV" ]]; then
+    ROOT_NIX_DEV="/dev/${LVM_VG}/${LVM_LV}"
+    info "NixOS root device (LVM): ${ROOT_NIX_DEV}"
+  fi
+elif [[ -n "$ROOT_BY_UUID" ]]; then
+  ROOT_NIX_DEV="$ROOT_BY_UUID"
+fi
+
+# --- Resolve extra mount devices to NixOS device paths ----------------------
+declare -A EXTRA_MOUNT_NIX_DEV=()  # mountpoint -> nix device path
+
+for mp in "${!EXTRA_MOUNTS[@]}"; do
+  SRC="${EXTRA_MOUNTS[$mp]}"
+  NIX_DEV="$SRC"
+
+  if [[ "${EXTRA_MOUNT_IS_LVM[$mp]}" == "true" ]]; then
+    # Resolve LVM mapper path to /dev/<vg>/<lv>
+    SRC_RESOLVED=$(readlink -f "$SRC" 2>/dev/null || echo "$SRC")
+    for dmpath in "${!LVM_LV_VG[@]}"; do
+      RESOLVED_LV=$(readlink -f "$dmpath" 2>/dev/null || echo "$dmpath")
+      if [[ "$SRC_RESOLVED" == "$RESOLVED_LV" ]]; then
+        NIX_DEV="/dev/${LVM_LV_VG[$dmpath]}/${LVM_LV_NAME[$dmpath]}"
+        break
+      fi
+    done
+  else
+    # Try to resolve to by-uuid
+    SRC_RESOLVED=$(readlink -f "$SRC" 2>/dev/null || echo "$SRC")
+    for uuid_link in /dev/disk/by-uuid/*; do
+      [[ -e "$uuid_link" ]] || continue
+      if [[ "$(readlink -f "$uuid_link")" == "$SRC_RESOLVED" ]]; then
+        NIX_DEV="$uuid_link"
+        break
+      fi
+    done
+  fi
+
+  EXTRA_MOUNT_NIX_DEV["$mp"]="$NIX_DEV"
+  info "Extra mount: ${mp} → ${NIX_DEV} (${EXTRA_MOUNT_FS[$mp]})"
+done
+
+
+# ===========================================================================
+# 4. Generate hardware-configuration.nix
+# ===========================================================================
+section "Generated: hardware-configuration.nix"
+
+HW_NIX=""
+HW_NIX+="{ config, lib, pkgs, modulesPath, ... }:\n"
+HW_NIX+="{\n"
+
+# Profile import — choose based on detected hypervisor
+if $IS_VMWARE; then
+  HW_NIX+="  # No qemu-guest.nix import needed — VMware guest support is handled\n"
+  HW_NIX+="  # by virtualisation.vmware.guest.enable below.\n"
+elif $IS_QEMU; then
+  HW_NIX+="  imports = [\n"
+  HW_NIX+="    (modulesPath + \"/profiles/qemu-guest.nix\")  # QEMU/KVM guest support\n"
+  HW_NIX+="  ];\n"
+fi
+HW_NIX+="\n"
+
+# --- Boot loader ---
+HW_NIX+="  # ── Boot loader ──────────────────────────────────────────────\n"
+if $IS_EFI; then
+  HW_NIX+="  boot.loader.grub = {\n"
+  HW_NIX+="    efiSupport = true;              # Enable EFI boot\n"
+  HW_NIX+="    efiInstallAsRemovable = true;   # Install to fallback EFI path (safer for VMs)\n"
+  HW_NIX+="    device = \"nodev\";               # No MBR install for EFI\n"
+  HW_NIX+="  };\n"
+else
+  HW_NIX+="  boot.loader.grub.device = \"${GRUB_DEV}\";  # MBR boot device\n"
+fi
+
+# /boot filesystem (separate partition — required for GRUB to update on nixos-rebuild)
+if $BOOT_IS_SEPARATE; then
+  BOOT_NIX_DEV="${BOOT_UUID:-${BOOT_DEV}}"
+  HW_NIX+="  fileSystems.\"/boot\" = {\n"
+  HW_NIX+="    device = \"${BOOT_NIX_DEV}\";\n"
+  HW_NIX+="    fsType = \"${BOOT_FSTYPE}\";\n"
+  HW_NIX+="  };\n"
+fi
+HW_NIX+="\n"
+
+# --- initrd modules ---
+HW_NIX+="  # ── initrd: modules needed to mount root ─────────────────────\n"
+HW_NIX+="  boot.initrd.availableKernelModules = [\n"
+for mod in "${INITRD_AVAILABLE[@]}"; do
+  HW_NIX+="    \"${mod}\"\n"
+done
+HW_NIX+="  ];\n"
+
+HW_NIX+="  boot.initrd.kernelModules = [\n"
+for mod in "${INITRD_KERNEL[@]}"; do
+  desc=""
+  case "$mod" in
+    dm_mod)      desc="  # Device mapper — REQUIRED for LVM root" ;;
+    dm_snapshot) desc="  # DM snapshot support for LVM" ;;
+    nvme)        desc="  # NVMe storage driver" ;;
+  esac
+  HW_NIX+="    \"${mod}\"${desc}\n"
+done
+HW_NIX+="  ];\n"
+HW_NIX+="\n"
+
+# --- LVM ---
+if $USES_LVM; then
+  HW_NIX+="  # ── LVM support ─────────────────────────────────────────────\n"
+  HW_NIX+="  # CRITICAL: Without this, the initrd cannot activate LVM volumes\n"
+  HW_NIX+="  # and boot will fail with: \"Timed out waiting for device /dev/mapper/...\"\n"
+  HW_NIX+="  boot.initrd.preLVMCommands = lib.mkDefault \"\";\n"
+  HW_NIX+="  boot.initrd.services.lvm.enable = true;  # Ensure LVM userspace tools (vgchange, etc.) are in initrd\n"
+  HW_NIX+="  services.lvm.enable = true;      # Enable LVM tooling in the booted system\n"
+  HW_NIX+="\n"
+fi
+
+# --- VMware guest support ---
+if $IS_VMWARE; then
+  HW_NIX+="  # ── VMware guest support ────────────────────────────────────\n"
+  HW_NIX+="  # Enables open-vm-tools, shared folders, display resize, and\n"
+  HW_NIX+="  # loads vmware kernel modules (vmw_balloon, vmhgfs, vmxnet3, etc.)\n"
+  HW_NIX+="  virtualisation.vmware.guest.enable = true;\n"
+  HW_NIX+="\n"
+fi
+
+# --- Boot kernel modules (non-initrd) ---
+if [[ ${#BOOT_KERNEL_MODULES[@]} -gt 0 ]]; then
+  HW_NIX+="  # ── Extra runtime kernel modules (loaded after boot) ────────\n"
+  HW_NIX+="  # Note: virtualisation.vmware.guest.enable already loads most VMware\n"
+  HW_NIX+="  # modules. These are listed explicitly as a safety net.\n"
+  HW_NIX+="  boot.kernelModules = [\n"
+  for mod in "${BOOT_KERNEL_MODULES[@]}"; do
+    HW_NIX+="    \"${mod}\"\n"
+  done
+  HW_NIX+="  ];\n"
+  HW_NIX+="\n"
+fi
+
+# --- Filesystems ---
+# NFS client support (if NFS mounts detected)
+if $USES_NFS; then
+  HW_NIX+="  # ── NFS client support ──────────────────────────────────────\n"
+  HW_NIX+="  # Required for mounting NFS shares. Without this, mount.nfs is missing.\n"
+  HW_NIX+="  boot.supportedFilesystems = [ \"nfs\" ];\n"
+  HW_NIX+="\n"
+fi
+
+HW_NIX+="  # ── Filesystems ───────────────────────────────────────────────\n"
+HW_NIX+="  fileSystems.\"/\" = {\n"
+HW_NIX+="    device = \"${ROOT_NIX_DEV}\";\n"
+HW_NIX+="    fsType = \"${ROOT_FSTYPE}\";\n"
+HW_NIX+="  };\n"
+
+# Extra mounts (data volumes, etc.)
+if [[ ${#EXTRA_MOUNTS[@]} -gt 0 ]]; then
+  HW_NIX+="\n"
+  # Sort mountpoints for deterministic output
+  SORTED_MPS=($(echo "${!EXTRA_MOUNTS[@]}" | tr ' ' '\n' | sort))
+  for mp in "${SORTED_MPS[@]}"; do
+    FS="${EXTRA_MOUNT_FS[$mp]}"
+    LVM_COMMENT=""
+    [[ "${EXTRA_MOUNT_IS_LVM[$mp]}" == "true" ]] && LVM_COMMENT="  # LVM volume"
+
+    # Detect network filesystems (NFS, CIFS, etc.) and add _netdev
+    IS_NET_FS=false
+    case "$FS" in
+      nfs|nfs4|cifs|smb|smbfs|glusterfs|ceph|lustre) IS_NET_FS=true ;;
+    esac
+
+    HW_NIX+="  fileSystems.\"${mp}\" = {${LVM_COMMENT}\n"
+    HW_NIX+="    device = \"${EXTRA_MOUNT_NIX_DEV[$mp]}\";\n"
+    HW_NIX+="    fsType = \"${FS}\";\n"
+    if $IS_NET_FS; then
+      HW_NIX+="    options = [ \"_netdev\" \"nofail\" ];  # _netdev: wait for network; nofail: don't block boot if mount fails\n"
+    fi
+    HW_NIX+="  };\n"
+  done
+fi
+
+# Swap
+HW_NIX+="\n"
+if [[ ${#SWAP_DEVS[@]} -gt 0 ]]; then
+  if $SWAP_IS_FILE; then
+    HW_NIX+="  # Swap file on root filesystem\n"
+    HW_NIX+="  # NOTE: For a VM, zramSwap is often a better choice — see optional section.\n"
+  fi
+  HW_NIX+="  swapDevices = [\n"
+  for sd in "${SWAP_DEVS[@]}"; do
+    HW_NIX+="    { device = \"${sd}\"; }\n"
+  done
+  HW_NIX+="  ];\n"
+fi
+
+HW_NIX+="\n"
+
+# --- Optional section ---
+HW_NIX+="  # ══════════════════════════════════════════════════════════════\n"
+HW_NIX+="  # OPTIONAL — uncomment what you need\n"
+HW_NIX+="  # ══════════════════════════════════════════════════════════════\n"
+HW_NIX+="\n"
+
+if $SWAP_IS_FILE; then
+  HW_NIX+="  # Use zram swap instead of swap file (recommended for VMs with ample RAM)\n"
+  HW_NIX+="  # Compressed RAM swap — avoids disk I/O, better latency.\n"
+  HW_NIX+="  # If you enable this, REMOVE or comment out swapDevices above.\n"
+  HW_NIX+="  # zramSwap.enable = true;\n"
+  HW_NIX+="\n"
+fi
+
+HW_NIX+="  # Firmware / microcode (usually not needed in VMs)\n"
+HW_NIX+="  # hardware.enableRedistributableFirmware = true;\n"
+
+if ! $IS_VMWARE; then
+  HW_NIX+="\n"
+  HW_NIX+="  # VMware guest tools (if running under VMware)\n"
+  HW_NIX+="  # virtualisation.vmware.guest.enable = true;\n"
+fi
+if ! $IS_QEMU; then
+  HW_NIX+="\n"
+  HW_NIX+="  # QEMU guest agent (if running under QEMU/KVM)\n"
+  HW_NIX+="  # services.qemuGuest.enable = true;\n"
+fi
+
+HW_NIX+="\n}\n"
+
+echo -e "$HW_NIX"
+
+# ===========================================================================
+# 5. Generate networking.nix  (systemd-networkd, NixOS 25.05+)
+# ===========================================================================
+section "Generated: networking.nix"
+
+NET_NIX=""
+NET_NIX+="{ lib, ... }:\n"
+NET_NIX+="{\n"
+
+# --- Core networking settings ---
+NET_NIX+="  # ── Core networking ──────────────────────────────────────────\n"
+NET_NIX+="  networking = {\n"
+NET_NIX+="    hostName = \"$(hostname -s)\";\n"
+
+DOMAIN=$(hostname -d 2>/dev/null || true)
+[[ -n "$DOMAIN" ]] && [[ "$DOMAIN" != "(none)" ]] && NET_NIX+="    domain = \"${DOMAIN}\";\n"
+
+NET_NIX+="\n"
+NET_NIX+="    useNetworkd = true;   # Use systemd-networkd (modern backend)\n"
+NET_NIX+="    useDHCP = false;      # Per-interface config below\n"
+
+if $USES_PREDICTABLE_NAMES; then
+  NET_NIX+="    usePredictableInterfaceNames = lib.mkForce true;\n"
+else
+  NET_NIX+="    usePredictableInterfaceNames = lib.mkForce false;\n"
+fi
+NET_NIX+="\n"
+NET_NIX+="    # Firewall — allow SSH; add more ports as needed\n"
+NET_NIX+="    firewall.allowedTCPPorts = [ 22 ];\n"
+NET_NIX+="  };\n"
+NET_NIX+="\n"
+
+# --- SSH ---
+NET_NIX+="  # ── SSH access ───────────────────────────────────────────────\n"
+NET_NIX+="  # Without this, you WILL be locked out of a headless VM after conversion.\n"
+NET_NIX+="  services.openssh.enable = true;\n"
+NET_NIX+="\n"
+
+# --- systemd-networkd configuration ---
+NET_NIX+="  # ── Network interfaces (systemd-networkd) ────────────────────\n"
+NET_NIX+="  systemd.network = {\n"
+NET_NIX+="    enable = true;\n"
+NET_NIX+="\n"
+
+# --- .link files to pin interface names by MAC ---
+NET_NIX+="    # Pin interface names by MAC so they survive the NixOS transition\n"
+LINK_PRIORITY=10
+for iface in "${ALL_IFACES[@]}"; do
+  PRIO=$(printf "%02d" $LINK_PRIORITY)
+  NET_NIX+="    links.\"${PRIO}-${iface}\" = {\n"
+  NET_NIX+="      matchConfig.MACAddress = \"${IFACE_MAC[$iface]}\";\n"
+  NET_NIX+="      linkConfig.Name = \"${iface}\";\n"
+  NET_NIX+="    };\n"
+  LINK_PRIORITY=$((LINK_PRIORITY + 10))
+done
+NET_NIX+="\n"
+
+# --- .network files ---
+NET_NIX+="    # Network configuration\n"
+NET_PRIORITY=10
+
+if [[ "$USES_DHCP" == "true" ]]; then
+  # ---- DHCP mode ----
+  for iface in "${ALL_IFACES[@]}"; do
+    PRIO=$(printf "%02d" $NET_PRIORITY)
+    NET_NIX+="    networks.\"${PRIO}-${iface}\" = {\n"
+    NET_NIX+="      matchConfig.MACAddress = \"${IFACE_MAC[$iface]}\";\n"
+
+    if [[ "${IFACE_DHCP[$iface]}" == "true" ]]; then
+      NET_NIX+="      networkConfig.DHCP = \"yes\";\n"
+      NET_NIX+="      dhcpV4Config.UseDNS = true;\n"
+    else
+      # Non-DHCP interface in a DHCP-primary setup
+      IPV4="${IFACE_IPV4[$iface]:-}"
+      if [[ -n "$IPV4" ]]; then
+        NET_NIX+="      networkConfig.DHCP = \"no\";\n"
+        ADDR_LIST=""
+        while IFS= read -r addr; do
+          [[ -z "$addr" ]] && continue
+          [[ -n "$ADDR_LIST" ]] && ADDR_LIST+=" "
+          ADDR_LIST+="\"${addr}\""
+        done <<< "$IPV4"
+        NET_NIX+="      address = [ ${ADDR_LIST} ];\n"
+      else
+        NET_NIX+="      networkConfig.DHCP = \"no\";\n"
+        NET_NIX+="      # No IP detected — configure as needed\n"
+      fi
+    fi
+
+    NET_NIX+="    };\n"
+    NET_PRIORITY=$((NET_PRIORITY + 10))
+  done
+else
+  # ---- Static IP mode ----
+  for iface in "${ALL_IFACES[@]}"; do
+    PRIO=$(printf "%02d" $NET_PRIORITY)
+    IPV4="${IFACE_IPV4[$iface]:-}"
+    IPV6="${IFACE_IPV6[$iface]:-}"
+    GW4="${IFACE_GATEWAY4[$iface]:-}"
+    GW6="${IFACE_GATEWAY6[$iface]:-}"
+
+    HAS_CONFIG=false
+    [[ -n "$IPV4" ]] && HAS_CONFIG=true
+
+    if $HAS_CONFIG; then
+      NET_NIX+="    networks.\"${PRIO}-${iface}\" = {\n"
+      NET_NIX+="      matchConfig.MACAddress = \"${IFACE_MAC[$iface]}\";\n"
+
+      # Collect all IPv4 addresses
+      ADDR_LIST=""
+      while IFS= read -r addr; do
+        [[ -z "$addr" ]] && continue
+        [[ -n "$ADDR_LIST" ]] && ADDR_LIST+=" "
+        ADDR_LIST+="\"${addr}\""
+      done <<< "$IPV4"
+
+      # Add non-link-local IPv6 addresses
+      if [[ -n "$IPV6" ]]; then
+        while IFS= read -r addr; do
+          [[ -z "$addr" ]] && continue
+          IP=$(echo "$addr" | cut -d'/' -f1)
+          [[ "$IP" == fe80:* ]] && continue
+          [[ -n "$ADDR_LIST" ]] && ADDR_LIST+=" "
+          ADDR_LIST+="\"${addr}\""
+        done <<< "$IPV6"
+      fi
+      NET_NIX+="      address = [ ${ADDR_LIST} ];\n"
+
+      # Gateway (only on interfaces that have one)
+      if [[ -n "$GW4" ]] || [[ -n "$GW6" ]]; then
+        GW_LIST=""
+        [[ -n "$GW4" ]] && GW_LIST+="\"${GW4}\""
+        if [[ -n "$GW6" ]]; then
+          [[ -n "$GW_LIST" ]] && GW_LIST+=" "
+          GW_LIST+="\"${GW6}\""
+        fi
+        NET_NIX+="      gateway = [ ${GW_LIST} ];\n"
+      fi
+
+      # DNS and search domains only on the primary interface
+      if [[ "$iface" == "$PRIMARY_IFACE" ]]; then
+        if [[ ${#NAMESERVERS[@]} -gt 0 ]]; then
+          DNS_LIST=""
+          for ns in "${NAMESERVERS[@]}"; do
+            [[ -n "$DNS_LIST" ]] && DNS_LIST+=" "
+            DNS_LIST+="\"${ns}\""
+          done
+          NET_NIX+="      dns = [ ${DNS_LIST} ];\n"
+        fi
+        if [[ ${#DNS_SEARCH_DOMAINS[@]} -gt 0 ]]; then
+          DOM_LIST=""
+          for dom in "${DNS_SEARCH_DOMAINS[@]}"; do
+            [[ -n "$DOM_LIST" ]] && DOM_LIST+=" "
+            DOM_LIST+="\"~${dom}\""  # ~ prefix = search domain in systemd-resolved
+          done
+          NET_NIX+="      domains = [ ${DOM_LIST} ];\n"
+        fi
+      fi
+
+      NET_NIX+="    };\n"
+    else
+      # Interface with no IP — provide a commented template
+      NET_NIX+="    # ${iface}: no IP address detected (mac: ${IFACE_MAC[$iface]:-unknown})\n"
+      NET_NIX+="    # Uncomment and configure if this is a private/backend network:\n"
+      NET_NIX+="    # networks.\"${PRIO}-${iface}\" = {\n"
+      NET_NIX+="    #   matchConfig.MACAddress = \"${IFACE_MAC[$iface]}\";\n"
+      NET_NIX+="    #   address = [ \"10.0.0.x/24\" ];\n"
+      NET_NIX+="    # };\n"
+    fi
+    NET_PRIORITY=$((NET_PRIORITY + 10))
+  done
+fi
+
+NET_NIX+="  };\n"  # close systemd.network
+
+NET_NIX+="\n"
+NET_NIX+="  # ══════════════════════════════════════════════════════════════\n"
+NET_NIX+="  # OPTIONAL — uncomment what you need\n"
+NET_NIX+="  # ══════════════════════════════════════════════════════════════\n"
+NET_NIX+="\n"
+NET_NIX+="  # Allow additional ports through the firewall\n"
+NET_NIX+="  # networking.firewall.allowedTCPPorts = [ 80 443 ];\n"
+NET_NIX+="\n"
+NET_NIX+="  # Enable nftables instead of iptables\n"
+NET_NIX+="  # networking.nftables.enable = true;\n"
+NET_NIX+="}\n"
+
+echo -e "$NET_NIX"
+
+# ===========================================================================
+# 6. Warnings and user questions
+# ===========================================================================
+section "IMPORTANT: Pre-conversion Checklist"
+
+echo ""
+echo -e "${BOLD}${RED}┌─────────────────────────────────────────────────────────────────┐${NC}"
+echo -e "${BOLD}${RED}│  CRITICAL ISSUES TO ADDRESS BEFORE RUNNING nixos-infect        │${NC}"
+echo -e "${BOLD}${RED}└─────────────────────────────────────────────────────────────────┘${NC}"
+echo ""
+
+if $USES_LVM; then
+  echo -e "${RED}[!!]${NC} ${BOLD}LVM ROOT FILESYSTEM DETECTED${NC}"
+  echo "     Your root is on LVM (${ROOT_DEV})."
+  echo "     The default nixos-infect does NOT include dm_mod in initrd.kernelModules,"
+  echo "     which causes the exact boot failure you've seen:"
+  echo "       'Timed out waiting for device /dev/mapper/ubuntu--vg-ubuntu--lv'"
+  echo ""
+  echo -e "     ${BOLD}Fix:${NC} Ensure hardware-configuration.nix includes:"
+  echo "       boot.initrd.kernelModules = [ \"dm_mod\" ];"
+  echo "       boot.initrd.services.lvm.enable = true;"
+  echo "       services.lvm.enable = true;"
+  echo ""
+  echo -e "     ${BOLD}Alternative:${NC} If possible, reinstall the VM without LVM"
+  echo "     (plain ext4 partition) to avoid this complexity entirely."
+  echo ""
+fi
+
+# --- DHCP detection confidence warning ---
+if ! $DHCP_DETECT_CONFIDENT; then
+  echo -e "${YELLOW}[!]${NC} ${BOLD}DHCP DETECTION MAY BE UNRELIABLE${NC}"
+  echo "     python3-yaml is not available, so DHCP detection used grep-based"
+  echo "     parsing of netplan YAML files. This can produce false positives"
+  echo "     if multiple interfaces share a netplan config file."
+  echo ""
+  echo -e "     ${BOLD}Verify manually:${NC}"
+  echo "       cat /etc/netplan/*.yaml"
+  echo "     Check that the dhcp4 setting matches what this script detected"
+  echo "     for each interface."
+  echo ""
+  echo -e "     ${BOLD}Fix:${NC} Install python3-yaml for reliable detection:"
+  echo "       apt install python3-yaml"
+  echo ""
+fi
+
+# --- Check for unconfigured interfaces ---
+HAS_UNCONFIGURED_IFACE=false
+for iface in "${ALL_IFACES[@]}"; do
+  if [[ -z "${IFACE_IPV4[$iface]:-}" ]] && [[ "${IFACE_HAS_DEFAULT_ROUTE[$iface]}" != "true" ]]; then
+    if ! $HAS_UNCONFIGURED_IFACE; then
+      echo -e "${YELLOW}[!]${NC} ${BOLD}UNCONFIGURED NETWORK INTERFACES${NC}"
+      HAS_UNCONFIGURED_IFACE=true
+    fi
+    echo "     ${iface} (mac: ${IFACE_MAC[$iface]}) has no IP address."
+    echo "     Common reasons:"
+    echo "       • Private/backend network — assign a static IP in networking.nix"
+    echo "       • Interface awaiting DHCP on a VLAN"
+    echo "       • Unused NIC that can be left unconfigured"
+    echo ""
+  fi
+done
+
+# --- Swap recommendations ---
+if $SWAP_IS_FILE; then
+  echo -e "${YELLOW}[!]${NC} ${BOLD}SWAP FILE — WILL BE LOST WITHOUT ACTION${NC}"
+  echo "     ${SWAP_DEVS[0]} is a swap file on the root filesystem."
+  echo "     NixOS lustration will move it to /old-root/ on first boot unless"
+  echo "     you add it to /etc/NIXOS_LUSTRATE (see workflow steps below)."
+  echo ""
+  if [[ $TOTAL_RAM_MB -ge 4096 ]]; then
+    echo "     With ${TOTAL_RAM_MB}MB RAM, swap is mainly a safety net."
+    echo "     Consider switching to zramSwap for better VM performance."
+  else
+    echo "     With ${TOTAL_RAM_MB}MB RAM, keeping the swap file is recommended."
+  fi
+  echo ""
+fi
+
+echo -e "${YELLOW}[?]${NC} ${BOLD}Questions to answer about your VMware configuration:${NC}"
+echo ""
+echo -e "  1. ${BOLD}SCSI controller type${NC} — Check VM settings → SCSI Controller"
+echo "     • LSI Logic SAS (default)  → needs: mptspi"
+echo "     • VMware Paravirtual       → needs: vmw_pvscsi"
+echo "     • BusLogic                 → needs: BusLogic"
+echo "     The script detected: [${LOADED_STORAGE_MODULES[*]:-none detected}]"
+echo ""
+echo -e "  2. ${BOLD}Network adapter type${NC} — Check VM settings → Network Adapter"
+echo "     • VMXNET3 (recommended)    → needs: vmxnet3"
+echo "     • E1000 / E1000e           → needs: e1000"
+echo "     The script detected: [${NET_MODULES[*]:-none detected}]"
+echo ""
+echo -e "  3. ${BOLD}Disk provisioning${NC} — Thin vs Thick provisioned"
+echo "     No NixOS config impact, but thin-provisioned disks may cause I/O"
+echo "     stalls during heavy writes if the datastore is overcommitted."
+echo ""
+echo -e "  4. ${BOLD}Network mode${NC} — DHCP (typical) vs Static IP"
+if [[ "$USES_DHCP" == "true" ]]; then
+  echo "     DHCP was detected. The generated networking.nix uses"
+  echo "     networkConfig.DHCP = \"yes\". Verify DHCP reservation in VMware/network."
+else
+  echo "     Static IP was detected. Verify the generated IPs, gateway and DNS"
+  echo "     match what you expect post-conversion."
+fi
+echo ""
+echo -e "  5. ${BOLD}Boot mode${NC} — EFI vs BIOS"
+if $IS_EFI; then
+  echo "     EFI detected. Ensure VM firmware is set to EFI in VMware settings."
+else
+  echo "     Legacy BIOS detected. Ensure VM firmware is set to BIOS in VMware."
+fi
+echo ""
+
+# ===========================================================================
+# 7. Patch suggestions for nixos-infect
+# ===========================================================================
+section "Suggested nixos-infect Patches"
+
+echo -e "If you want to use nixos-infect as-is with minimal changes, apply"
+echo -e "these modifications to the script ${BOLD}before${NC} running it:\n"
+
+if $USES_LVM; then
+  echo -e "${BOLD}Patch 1: Add LVM modules to initrd${NC}"
+  echo '  In the makeConf() function, after the line:'
+  echo '    boot.initrd.kernelModules = [ "nvme" ];'
+  echo '  Change it to:'
+  echo '    boot.initrd.kernelModules = [ "nvme" "dm_mod" "dm_snapshot" ];'
+  echo ""
+  echo -e "${BOLD}Patch 2: Add LVM service${NC}"
+  echo '  Add these lines in the hardware-configuration.nix heredoc:'
+  echo '    boot.initrd.services.lvm.enable = true;'
+  echo '    services.lvm.enable = true;'
+  echo ""
+fi
+
+if $IS_VMWARE; then
+  echo -e "${BOLD}Patch: Ensure VMware storage modules are included${NC}"
+  echo '  The script already adds "vmw_pvscsi" for x86_64.'
+  echo '  If your VM uses LSI Logic, also add "mptspi" to availableKernelModules.'
+  echo ""
+fi
+
+section "Done"
+echo -e "Review the generated configurations above and copy them to your VM"
+echo -e "at /etc/nixos/ before (or instead of letting nixos-infect generate them)."
+echo ""
+echo -e "${BOLD}Recommended workflow:${NC}"
+echo ""
+echo -e "  ${BOLD}Step 1: Run nixos-infect without rebooting${NC}"
+echo "    NO_REBOOT=1 bash nixos-infect"
+echo ""
+echo -e "  ${BOLD}Step 2: Replace the generated configs with the inspected ones${NC}"
+echo "    cp hardware-configuration.nix /etc/nixos/hardware-configuration.nix"
+echo "    cp networking.nix /etc/nixos/networking.nix"
+echo ""
+
+echo -e "  ${BOLD}Step 3: Add networking.nix to the imports in configuration.nix${NC}"
+echo "    # CRITICAL: nixos-infect's configuration.nix only imports"
+echo "    # hardware-configuration.nix. Without this step, networking.nix"
+echo "    # is ignored and the machine boots with DHCP (wrong) and no"
+echo "    # static IPs — you will be locked out on a static-only network."
+echo "    sed -i '/\.\/hardware-configuration\.nix/a\\    ./networking.nix' /etc/nixos/configuration.nix"
+echo "    # Verify the import was added:"
+echo "    grep 'networking.nix' /etc/nixos/configuration.nix || {"
+echo "      echo 'ERROR: Failed to patch configuration.nix — add ./networking.nix to imports manually'"
+echo "      exit 1"
+echo "    }"
+echo ""
+
+# Also remove nixos-infect's default lines that would conflict with networking.nix
+echo -e "  ${BOLD}Step 4: Remove conflicting defaults from configuration.nix${NC}"
+echo "    # nixos-infect sets networking.hostName, networking.domain,"
+echo "    # networking.useDHCP, and services.openssh.enable in configuration.nix."
+echo "    # These conflict with networking.nix (NixOS errors on duplicate"
+echo "    # non-mergeable options). Remove them so networking.nix takes effect."
+echo "    sed -i '/networking\.hostName/d' /etc/nixos/configuration.nix"
+echo "    sed -i '/networking\.domain/d' /etc/nixos/configuration.nix"
+echo "    sed -i '/networking\.useDHCP/d' /etc/nixos/configuration.nix"
+echo "    sed -i '/services\.openssh\.enable/d' /etc/nixos/configuration.nix"
+echo ""
+
+if $SWAP_IS_FILE; then
+  echo -e "  ${BOLD}Step 5: Preserve swap file through lustration${NC}"
+  echo "    # NixOS lustration moves everything not listed in NIXOS_LUSTRATE"
+  echo "    # to /old-root/. Without this, your swap file disappears on first boot."
+  for sd in "${SWAP_DEVS[@]}"; do
+    # Only add entries for swap files (not device paths)
+    if [[ "$sd" == /* ]] && [[ ! "$sd" == /dev/* ]]; then
+      # Strip leading slash for NIXOS_LUSTRATE format
+      SWAP_REL="${sd#/}"
+      echo "    echo '${SWAP_REL}' >> /etc/NIXOS_LUSTRATE"
+    fi
+  done
+  echo ""
+  NEXT_STEP=6
+else
+  NEXT_STEP=5
+fi
+
+echo -e "  ${BOLD}Step ${NEXT_STEP}: Rebuild NixOS with the corrected configs${NC}"
+echo "    # CRITICAL: switch-to-configuration alone does NOT rebuild from .nix files."
+echo "    # You must rebuild the system profile, or the replaced configs are ignored."
+echo "    nix-env -p /nix/var/nix/profiles/system \\"
+echo "      -I nixpkgs=\$(realpath /root/.nix-defexpr/channels/nixos) \\"
+echo "      -f '<nixpkgs/nixos>' --set -A system"
+echo ""
+
+NEXT_STEP=$((NEXT_STEP + 1))
+echo -e "  ${BOLD}Step ${NEXT_STEP}: Verify the rebuild succeeded before switching${NC}"
+echo "    # Check that the new system profile was built correctly."
+echo "    # If the previous step failed, DO NOT proceed — fix the config errors first."
+echo "    ls -la /nix/var/nix/profiles/system"
+if $USES_LVM; then
+  echo "    # Verify the initrd contains LVM tools:"
+  echo "    { zstdcat /nix/var/nix/profiles/system/initrd 2>/dev/null || \\"
+  echo "      zcat /nix/var/nix/profiles/system/initrd 2>/dev/null; } | \\"
+  echo "      cpio -t 2>/dev/null | grep -qi lvm || \\"
+  echo "      echo 'WARNING: lvm not found in initrd — boot may fail!'"
+fi
+echo ""
+
+NEXT_STEP=$((NEXT_STEP + 1))
+echo -e "  ${BOLD}Step ${NEXT_STEP}: Set the rebuilt system as boot target${NC}"
+echo "    /nix/var/nix/profiles/system/bin/switch-to-configuration boot"
+echo ""
+
+NEXT_STEP=$((NEXT_STEP + 1))
+echo -e "  ${BOLD}Step ${NEXT_STEP}: Reboot${NC}"
+echo "    reboot"
