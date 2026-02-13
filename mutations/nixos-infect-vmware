@@ -568,7 +568,7 @@ detect_network_modules() {
 detect_vmware_modules() {
   if $IS_VMWARE; then
     section "VMware-Specific Module Detection"
-    VMWARE_MODULES=("vmw_balloon" "vmw_vmci" "vmwgfx" "vmw_vsock_vmci_transport" "vmxnet3" "vmw_pvscsi")
+    VMWARE_MODULES=("vmw_balloon" "vmw_vmci" "vmwgfx" "vmw_vsock_vmci_transport" "vmxnet3")
     for mod in "${VMWARE_MODULES[@]}"; do
       if lsmod | grep -qw "$mod"; then
         info "Loaded: ${mod}"
@@ -798,8 +798,20 @@ build_kernel_module_lists() {
   INITRD_AVAILABLE+=("sd_mod")
 
   if $IS_VMWARE; then
-    INITRD_AVAILABLE+=("vmw_pvscsi")
-    INITRD_AVAILABLE+=("mptspi")
+    # Only add SCSI drivers for controllers actually present
+    if lspci 2>/dev/null | grep -qi 'pvscsi\|paravirtual'; then
+      INITRD_AVAILABLE+=("vmw_pvscsi")
+      info "VMware PVSCSI controller detected"
+    fi
+    if lspci 2>/dev/null | grep -qi 'LSI\|53c1030\|Fusion-MPT\|mptspi'; then
+      INITRD_AVAILABLE+=("mptspi")
+      info "LSI Logic/mptspi SCSI controller detected"
+    fi
+    # Fallback: if neither SCSI controller detected, add both for safety
+    if ! printf '%s\n' "${INITRD_AVAILABLE[@]}" | grep -qE 'vmw_pvscsi|mptspi'; then
+      INITRD_AVAILABLE+=("vmw_pvscsi" "mptspi")
+      warn "No SCSI controller detected — adding both vmw_pvscsi and mptspi as fallback"
+    fi
     INITRD_AVAILABLE+=("ahci")
   fi
 
