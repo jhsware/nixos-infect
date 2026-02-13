@@ -64,6 +64,7 @@ declare -A LVM_LV_SIZE=()
 declare -A EXTRA_MOUNTS=()
 declare -A EXTRA_MOUNT_FS=()
 declare -A EXTRA_MOUNT_IS_LVM=()
+declare -A EXTRA_MOUNT_OPTIONS=()
 USES_NFS=false
 USES_NET_FS=false
 
@@ -318,10 +319,11 @@ detect_extra_mounts() {
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
 
-    MT_SOURCE="" MT_TARGET="" MT_FSTYPE=""
+    MT_SOURCE="" MT_TARGET="" MT_FSTYPE="" MT_OPTIONS=""
     [[ "$line" =~ SOURCE=\"([^\"]*)\" ]] && MT_SOURCE="${BASH_REMATCH[1]}"
     [[ "$line" =~ TARGET=\"([^\"]*)\" ]] && MT_TARGET="${BASH_REMATCH[1]}"
     [[ "$line" =~ FSTYPE=\"([^\"]*)\" ]] && MT_FSTYPE="${BASH_REMATCH[1]}"
+    [[ "$line" =~ OPTIONS=\"([^\"]*)\" ]] && MT_OPTIONS="${BASH_REMATCH[1]}"
 
     [[ -z "$MT_TARGET" ]] && continue
 
@@ -362,7 +364,8 @@ detect_extra_mounts() {
       IS_LVM_MOUNT=true
     fi
     EXTRA_MOUNT_IS_LVM["$MT_TARGET"]="$IS_LVM_MOUNT"
-  done < <(findmnt -Pn -o SOURCE,TARGET,FSTYPE 2>/dev/null)
+    EXTRA_MOUNT_OPTIONS["$MT_TARGET"]="$MT_OPTIONS"
+  done < <(findmnt -Pn -o SOURCE,TARGET,FSTYPE,OPTIONS 2>/dev/null)
 
   # Check for network filesystems
   USES_NFS=false
@@ -618,7 +621,13 @@ detect_network_config() {
     while IFS= read -r line; do
       if [[ "$line" =~ DNS\ Domain:\ *(.*) ]]; then
         for dom in ${BASH_REMATCH[1]}; do
-          [[ -n "$dom" ]] && DNS_SEARCH_DOMAINS+=("$dom")
+          [[ -n "$dom" ]] || continue
+          # Deduplicate (same domain can appear on multiple links)
+          ALREADY=false
+          for existing in "${DNS_SEARCH_DOMAINS[@]:-}"; do
+            [[ "$existing" == "$dom" ]] && ALREADY=true && break
+          done
+          $ALREADY || DNS_SEARCH_DOMAINS+=("$dom")
         done
       fi
     done < <(resolvectl status 2>/dev/null)
@@ -1134,7 +1143,31 @@ generate_hardware_config() {
       HW_NIX+="    device = \"${EXTRA_MOUNT_NIX_DEV[$mp]}\";\n"
       HW_NIX+="    fsType = \"${FS}\";\n"
       if $IS_NET_FS; then
-        HW_NIX+="    options = [ \"_netdev\" \"nofail\" ];\n"
+        # Preserve original mount options, ensure _netdev and nofail are always present
+        ORIG_OPTS="${EXTRA_MOUNT_OPTIONS[$mp]:-}"
+        declare -A OPT_SET=()
+        OPT_SET["_netdev"]=1
+        OPT_SET["nofail"]=1
+        if [[ -n "$ORIG_OPTS" ]]; then
+          IFS=',' read -ra OPTS_ARR <<< "$ORIG_OPTS"
+          for opt in "${OPTS_ARR[@]}"; do
+            opt="${opt## }"; opt="${opt%% }"  # trim whitespace
+            [[ -z "$opt" ]] && continue
+            [[ "$opt" == "rw" ]] && continue       # NixOS default
+            [[ "$opt" == "defaults" ]] && continue  # meaningless in NixOS
+            OPT_SET["$opt"]=1
+          done
+        fi
+        # Build sorted option list (_netdev and nofail first, rest sorted)
+        OPT_LIST="\"_netdev\" \"nofail\""
+        EXTRA_OPTS=""
+        for opt in $(echo "${!OPT_SET[@]}" | tr ' ' '\n' | sort); do
+          [[ "$opt" == "_netdev" ]] && continue
+          [[ "$opt" == "nofail" ]] && continue
+          EXTRA_OPTS+=" \"${opt}\""
+        done
+        OPT_LIST+="${EXTRA_OPTS}"
+        HW_NIX+="    options = [ ${OPT_LIST} ];\n"
       fi
       HW_NIX+="  };\n"
     done
@@ -1164,10 +1197,9 @@ generate_networking_config() {
   # Core networking settings
   NET_NIX+="  # ── Core networking ──────────────────────────────────────────\n"
   NET_NIX+="  networking = {\n"
-  NET_NIX+="    hostName = \"$(hostname -s)\";\n"
+  NET_NIX+="    # NOTE: hostName and domain are set in configuration.nix (user-editable)\n"
+  NET_NIX+="    # Do NOT set them here to avoid NixOS module system conflicts.\n"
 
-  DOMAIN=$(hostname -d 2>/dev/null || true)
-  [[ -n "$DOMAIN" ]] && [[ "$DOMAIN" != "(none)" ]] && NET_NIX+="    domain = \"${DOMAIN}\";\n"
 
   NET_NIX+="\n"
   NET_NIX+="    useNetworkd = true;   # Use systemd-networkd (modern backend)\n"
@@ -1407,9 +1439,7 @@ patch_configuration_nix() {
   fi
 
   # Remove conflicting lines that nixos-infect sets
-  # These are now handled by networking.nix
-  sed -i '/networking\.hostName/d' "$CONF"
-  sed -i '/networking\.domain/d' "$CONF"
+  # These are now handled by networking.nix (hostName and domain stay in configuration.nix)
   sed -i '/networking\.useDHCP/d' "$CONF"
   sed -i '/services\.openssh\.enable/d' "$CONF"
   info "Removed conflicting networking/SSH lines from configuration.nix"
@@ -1529,7 +1559,7 @@ main() {
       echo ""
       info "Step 4: Patch /etc/nixos/configuration.nix"
       detail "Add ./networking.nix to imports"
-      detail "Remove conflicting lines: networking.hostName, networking.domain, networking.useDHCP, services.openssh.enable"
+      detail "Remove conflicting lines: networking.useDHCP, services.openssh.enable"
       echo ""
       if $SWAP_IS_FILE; then
         info "Step 5: Preserve swap file through lustration"
