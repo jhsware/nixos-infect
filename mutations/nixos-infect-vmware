@@ -7,11 +7,15 @@
 # Modes:
 #   inspect  — Detect hardware and output generated NixOS configs (no changes)
 #   apply    — Run nixos-infect, replace configs with VMware-aware versions,
-#              rebuild and activate (never reboots)
+#              rebuild and activate (never reboots unless --reboot is set)
 #
 # Usage:
 #   nixos-infect-vmware --mode inspect
 #   nixos-infect-vmware --mode apply
+#   nixos-infect-vmware --mode apply --dry-run
+#   nixos-infect-vmware --inspect
+#   nixos-infect-vmware --apply --reboot
+#
 #
 # Target: NixOS 25.05+
 
@@ -23,6 +27,8 @@ set -euo pipefail
 
 # Mode: "inspect" or "apply"
 MODE="inspect"
+DRY_RUN=false
+ALLOW_REBOOT=false
 
 # System facts
 ARCH=""
@@ -143,8 +149,28 @@ parse_args() {
           exit 1
         fi
         ;;
+      --inspect)
+        MODE="inspect"
+        ;;
+      --apply)
+        MODE="apply"
+        ;;
+      --dry-run)
+        DRY_RUN=true
+        ;;
+      --reboot)
+        ALLOW_REBOOT=true
+        ;;
       --help|-h)
-        echo "Usage: $0 --mode <inspect|apply>"
+        echo "Usage: $0 [OPTIONS]"
+        echo ""
+        echo "Options:"
+        echo "  --mode <inspect|apply>  Set mode (default: inspect)"
+        echo "  --inspect               Shorthand for --mode inspect"
+        echo "  --apply                 Shorthand for --mode apply"
+        echo "  --dry-run               Show what would be done without executing (apply mode)"
+        echo "  --reboot                Allow reboot after successful apply (default: no reboot)"
+        echo "  --help, -h              Show this help"
         echo ""
         echo "Modes:"
         echo "  inspect  Detect hardware and output NixOS configs (no changes made)"
@@ -1321,15 +1347,17 @@ replace_configs() {
     exit 1
   fi
 
-  # Backup originals
-  if [[ -f /etc/nixos/hardware-configuration.nix ]]; then
-    cp /etc/nixos/hardware-configuration.nix /etc/nixos/hardware-configuration.nix.nixos-infect-backup
-    info "Backed up original hardware-configuration.nix"
-  fi
-  if [[ -f /etc/nixos/networking.nix ]]; then
-    cp /etc/nixos/networking.nix /etc/nixos/networking.nix.nixos-infect-backup
-    info "Backed up original networking.nix"
-  fi
+  # Create timestamped backup directory
+  local BACKUP_DIR="/etc/nixos/backup-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$BACKUP_DIR"
+  info "Backup directory: ${BACKUP_DIR}"
+
+  # Backup all existing .nix files
+  for nixfile in /etc/nixos/*.nix; do
+    [[ -f "$nixfile" ]] || continue
+    cp "$nixfile" "$BACKUP_DIR/"
+    info "Backed up $(basename "$nixfile")"
+  done
 
   # Write our VMware-aware configs
   echo -e "$HW_NIX" > /etc/nixos/hardware-configuration.nix
@@ -1378,12 +1406,20 @@ patch_configuration_nix() {
 rebuild_system() {
   section "Rebuilding NixOS system profile"
 
+  # Pre-flight: verify nixos-infect actually ran
+  if [[ ! -f /etc/nixos/configuration.nix ]]; then
+    error "/etc/nixos/configuration.nix not found — nixos-infect may not have completed"
+    error "Cannot rebuild without a base configuration. Re-run with --apply."
+    exit 1
+  fi
+
   # Rebuild from the corrected configs
   info "Building NixOS system (this may take several minutes)..."
   nix-env -p /nix/var/nix/profiles/system \
     -I nixpkgs=$(realpath /root/.nix-defexpr/channels/nixos) \
     -f '<nixpkgs/nixos>' --set -A system || {
     error "System rebuild failed — check /etc/nixos/ for config errors"
+    error "Your original configs are backed up in /etc/nixos/backup-*/"
     exit 1
   }
   info "System profile rebuilt successfully"
@@ -1396,8 +1432,10 @@ rebuild_system() {
          cpio -t 2>/dev/null | grep -qi lvm; then
       info "LVM tools found in initrd — boot should succeed"
     else
-      warn "LVM tools NOT found in initrd — boot may fail!"
-      warn "Verify boot.initrd.services.lvm.enable = true in hardware-configuration.nix"
+      error "LVM tools NOT found in initrd — boot WILL fail!"
+      error "Verify boot.initrd.services.lvm.enable = true in hardware-configuration.nix"
+      error "Aborting before activating a potentially unbootable system."
+      exit 1
     fi
   fi
 
@@ -1420,10 +1458,8 @@ rebuild_system() {
     exit 1
   }
   info "Boot target set successfully"
-
-  warn "System is ready. Reboot manually when you are satisfied with the configuration."
-  warn "Review /etc/nixos/ before rebooting."
 }
+
 
 # ===========================================================================
 # Main
@@ -1438,8 +1474,10 @@ main() {
   fi
 
   info "Mode: ${MODE}"
+  $DRY_RUN && info "Dry-run: showing planned actions without executing"
+  $ALLOW_REBOOT && info "Reboot: will reboot after successful apply"
 
-  # Run detection
+  # Run detection (always — needed for both modes)
   run_detection
 
   # Pre-flight safety checks (blocks apply mode on errors)
@@ -1459,12 +1497,74 @@ main() {
   fi
 
   if [[ "$MODE" == "apply" ]]; then
+    # Pre-flight: verify nixos-infect has been run (unless we're about to run it)
+    # In dry-run mode, just show what would happen
+
+    if $DRY_RUN; then
+      section "Dry Run — Planned Actions"
+      echo ""
+      info "Step 1: Download and run nixos-infect with NO_REBOOT=1"
+      detail "URL: ${NIXOS_INFECT_URL:-https://raw.githubusercontent.com/elitak/nixos-infect/master/nixos-infect}"
+      detail "Channel: ${NIX_CHANNEL:-nixos-25.05}"
+      echo ""
+      info "Step 2: Backup existing /etc/nixos/*.nix to /etc/nixos/backup-TIMESTAMP/"
+      echo ""
+      info "Step 3: Write VMware-aware configs"
+      detail "hardware-configuration.nix → /etc/nixos/hardware-configuration.nix"
+      detail "networking.nix → /etc/nixos/networking.nix"
+      echo ""
+      info "Step 4: Patch /etc/nixos/configuration.nix"
+      detail "Add ./networking.nix to imports"
+      detail "Remove conflicting lines: networking.hostName, networking.domain, networking.useDHCP, services.openssh.enable"
+      echo ""
+      if $SWAP_IS_FILE; then
+        info "Step 5: Preserve swap file through lustration"
+        for sd in "${SWAP_DEVS[@]}"; do
+          if [[ "$sd" == /* ]] && [[ ! "$sd" == /dev/* ]]; then
+            detail "Add ${sd#/} to /etc/NIXOS_LUSTRATE"
+          fi
+        done
+        echo ""
+      fi
+      info "Step 6: Rebuild NixOS system profile"
+      detail "nix-env -p /nix/var/nix/profiles/system -f '<nixpkgs/nixos>' --set -A system"
+      echo ""
+      if $USES_LVM; then
+        info "Step 7: Verify LVM tools in initrd"
+        detail "Check initrd contains lvm binaries"
+        echo ""
+      fi
+      info "Step 8: Activate boot configuration"
+      detail "/nix/var/nix/profiles/system/bin/switch-to-configuration boot"
+      echo ""
+      if $ALLOW_REBOOT; then
+        info "Step 9: Reboot system"
+      else
+        info "Step 9: No reboot (use --reboot to enable)"
+      fi
+      echo ""
+      section "Generated: hardware-configuration.nix"
+      echo -e "$HW_NIX"
+      section "Generated: networking.nix"
+      echo -e "$NET_NIX"
+      info "Dry run complete — no changes made."
+      exit 0
+    fi
+
+    # Actual apply
     section "Apply Mode"
     run_nixos_infect
     replace_configs
     patch_configuration_nix
     rebuild_system
-    info "Apply complete. Review /etc/nixos/ and reboot when ready."
+    info "Apply complete."
+    if $ALLOW_REBOOT; then
+      warn "Rebooting in 5 seconds... (Ctrl+C to abort)"
+      sleep 5
+      reboot
+    else
+      warn "Review /etc/nixos/ and reboot when ready."
+    fi
     exit 0
   fi
 }
