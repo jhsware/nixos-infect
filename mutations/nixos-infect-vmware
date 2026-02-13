@@ -1502,7 +1502,24 @@ patch_configuration_nix() {
 rebuild_system() {
   section "Rebuilding NixOS system profile"
 
+  # Ensure Nix binaries are in PATH (nixos-infect single-user install
+  # may not have updated PATH in the current shell)
+  if ! command -v nix-env &>/dev/null; then
+    if [[ -e /root/.nix-profile/etc/profile.d/nix.sh ]]; then
+      # shellcheck disable=SC1091
+      source /root/.nix-profile/etc/profile.d/nix.sh
+      info "Sourced Nix profile to set PATH"
+    elif [[ -x /nix/var/nix/profiles/default/bin/nix-env ]]; then
+      export PATH="/nix/var/nix/profiles/default/bin:$PATH"
+      info "Added Nix default profile to PATH"
+    else
+      error "nix-env not found — Nix may not be installed correctly"
+      exit 1
+    fi
+  fi
+
   # Pre-flight: verify nixos-infect actually ran
+
   if [[ ! -f /etc/nixos/configuration.nix ]]; then
     error "/etc/nixos/configuration.nix not found — nixos-infect may not have completed"
     error "Cannot rebuild without a base configuration. Re-run with --apply."
