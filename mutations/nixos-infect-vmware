@@ -1031,6 +1031,43 @@ preflight_checks() {
   fi
 }
 
+
+# Build LVM global_filter from detected PV devices
+# Partition PVs (e.g. /dev/sda3) → allow disk + all partitions: a|/dev/sda.*|
+# Whole-disk PVs (e.g. /dev/sdb) → exact match only: a|/dev/sdb$|
+build_lvm_filter() {
+  local -a filter_entries=()
+  local -A seen_disks=()
+
+  for pv_dev in "${!LVM_PV_DEVICES[@]}"; do
+    # Extract base disk name: /dev/sda3 → sda, /dev/sdb → sdb
+    local base_disk
+    base_disk=$(echo "$pv_dev" | sed -E 's|^/dev/||; s|[0-9]+$||')
+
+    [[ -n "${seen_disks[$base_disk]:-}" ]] && continue
+    seen_disks["$base_disk"]=1
+
+    # Check if this is a whole-disk PV or partition PV
+    if [[ "$pv_dev" =~ [0-9]+$ ]]; then
+      # Partition PV (e.g., /dev/sda3) — allow disk and all partitions
+      filter_entries+=("\"a|/dev/${base_disk}.*|\"")
+    else
+      # Whole-disk PV (e.g., /dev/sdb) — exact match only, no partitions
+      filter_entries+=("\"a|/dev/${base_disk}\$|\"")
+    fi
+  done
+
+  # Sort for deterministic output
+  IFS=$'\n' filter_entries=($(sort <<<"${filter_entries[*]}")); unset IFS
+
+  # Add reject-all at the end
+  filter_entries+=("\"r|.*|\"")
+
+  # Join with space
+  echo "${filter_entries[*]}"
+}
+
+
 # ===========================================================================
 # Config generation — hardware-configuration.nix
 # ===========================================================================
@@ -1102,6 +1139,23 @@ generate_hardware_config() {
     HW_NIX+="  boot.initrd.services.lvm.enable = true;  # Ensure LVM userspace tools in initrd\n"
     HW_NIX+="  services.lvm.enable = true;      # Enable LVM tooling in the booted system\n"
     HW_NIX+="\n"
+
+    # LVM device filter — prevent duplicate PV detection on VMware
+    if [[ ${#LVM_PV_DEVICES[@]} -gt 0 ]]; then
+      local LVM_FILTER
+      LVM_FILTER=$(build_lvm_filter)
+      HW_NIX+="  # ── LVM device filter ──────────────────────────────────────\n"
+      HW_NIX+="  # Prevent duplicate PV detection on VMware (no disk serial numbers)\n"
+      HW_NIX+="  boot.initrd.systemd.contents.\"/etc/lvm/lvm.conf\".text = ''\n"
+      HW_NIX+="    devices {\n"
+      HW_NIX+="      global_filter = [ ${LVM_FILTER} ]\n"
+      HW_NIX+="      use_devicesfile = 0\n"
+      HW_NIX+="    }\n"
+      HW_NIX+="  '';\n"
+      HW_NIX+="\n"
+      info "LVM device filter: global_filter = [ ${LVM_FILTER} ]"
+    fi
+
   fi
 
   # VMware guest support
