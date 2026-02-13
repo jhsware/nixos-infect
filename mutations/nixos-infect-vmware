@@ -59,6 +59,7 @@ LVM_LV=""
 declare -A LVM_LV_VG=()
 declare -A LVM_LV_NAME=()
 declare -A LVM_LV_SIZE=()
+declare -A LVM_PV_DEVICES=()  # PV device paths for LVM filter generation
 
 # Extra mounts
 declare -A EXTRA_MOUNTS=()
@@ -286,6 +287,15 @@ detect_lvm() {
         LVM_LV_SIZE["$local_dmpath"]="$local_size"
       done < <(lvs --noheadings -o vg_name,lv_name,lv_size,lv_dm_path 2>/dev/null)
 
+      # Collect PV device paths for LVM filter generation
+      while IFS= read -r pv_line; do
+        local pv_dev
+        pv_dev=$(echo "$pv_line" | awk '{print $1}')
+        [[ -n "$pv_dev" ]] && LVM_PV_DEVICES["$pv_dev"]=1
+      done < <(pvs --noheadings -o pv_name 2>/dev/null)
+
+
+
       # Identify root LV
       if [[ "$ROOT_DEV" == /dev/mapper/* ]] || [[ "$ROOT_DEV" == /dev/dm-* ]]; then
         ROOT_DEV_RESOLVED_TMP=$(readlink -f "$ROOT_DEV" 2>/dev/null || echo "$ROOT_DEV")
@@ -299,6 +309,9 @@ detect_lvm() {
         done
       fi
       info "LVM detected — VG: ${LVM_VG:-unknown}, LV: ${LVM_LV:-unknown}"
+      if [[ ${#LVM_PV_DEVICES[@]} -gt 0 ]]; then
+        detail "  PV devices: ${!LVM_PV_DEVICES[*]}"
+      fi
       warn "LVM requires dm_mod and lvm2 in initrd — this is the #1 cause of nixos-infect boot failures!"
     fi
   else
@@ -555,7 +568,7 @@ detect_network_modules() {
 detect_vmware_modules() {
   if $IS_VMWARE; then
     section "VMware-Specific Module Detection"
-    VMWARE_MODULES=("vmw_balloon" "vmw_vmci" "vmwgfx" "vmw_vsock_vmci_transport" "vmxnet3" "vmw_pvscsi")
+    VMWARE_MODULES=("vmw_balloon" "vmw_vmci" "vmwgfx" "vmw_vsock_vmci_transport" "vmxnet3")
     for mod in "${VMWARE_MODULES[@]}"; do
       if lsmod | grep -qw "$mod"; then
         info "Loaded: ${mod}"
@@ -785,8 +798,20 @@ build_kernel_module_lists() {
   INITRD_AVAILABLE+=("sd_mod")
 
   if $IS_VMWARE; then
-    INITRD_AVAILABLE+=("vmw_pvscsi")
-    INITRD_AVAILABLE+=("mptspi")
+    # Only add SCSI drivers for controllers actually present
+    if lspci 2>/dev/null | grep -qi 'pvscsi\|paravirtual'; then
+      INITRD_AVAILABLE+=("vmw_pvscsi")
+      info "VMware PVSCSI controller detected"
+    fi
+    if lspci 2>/dev/null | grep -qi 'LSI\|53c1030\|Fusion-MPT\|mptspi'; then
+      INITRD_AVAILABLE+=("mptspi")
+      info "LSI Logic/mptspi SCSI controller detected"
+    fi
+    # Fallback: if neither SCSI controller detected, add both for safety
+    if ! printf '%s\n' "${INITRD_AVAILABLE[@]}" | grep -qE 'vmw_pvscsi|mptspi'; then
+      INITRD_AVAILABLE+=("vmw_pvscsi" "mptspi")
+      warn "No SCSI controller detected — adding both vmw_pvscsi and mptspi as fallback"
+    fi
     INITRD_AVAILABLE+=("ahci")
   fi
 
@@ -1018,6 +1043,43 @@ preflight_checks() {
   fi
 }
 
+
+# Build LVM global_filter from detected PV devices
+# Partition PVs (e.g. /dev/sda3) → allow disk + all partitions: a|/dev/sda.*|
+# Whole-disk PVs (e.g. /dev/sdb) → exact match only: a|/dev/sdb$|
+build_lvm_filter() {
+  local -a filter_entries=()
+  local -A seen_disks=()
+
+  for pv_dev in "${!LVM_PV_DEVICES[@]}"; do
+    # Extract base disk name: /dev/sda3 → sda, /dev/sdb → sdb
+    local base_disk
+    base_disk=$(echo "$pv_dev" | sed -E 's|^/dev/||; s|[0-9]+$||')
+
+    [[ -n "${seen_disks[$base_disk]:-}" ]] && continue
+    seen_disks["$base_disk"]=1
+
+    # Check if this is a whole-disk PV or partition PV
+    if [[ "$pv_dev" =~ [0-9]+$ ]]; then
+      # Partition PV (e.g., /dev/sda3) — allow disk and all partitions
+      filter_entries+=("\"a|/dev/${base_disk}.*|\"")
+    else
+      # Whole-disk PV (e.g., /dev/sdb) — exact match only, no partitions
+      filter_entries+=("\"a|/dev/${base_disk}\$|\"")
+    fi
+  done
+
+  # Sort for deterministic output
+  IFS=$'\n' filter_entries=($(sort <<<"${filter_entries[*]}")); unset IFS
+
+  # Add reject-all at the end
+  filter_entries+=("\"r|.*|\"")
+
+  # Join with space
+  echo "${filter_entries[*]}"
+}
+
+
 # ===========================================================================
 # Config generation — hardware-configuration.nix
 # ===========================================================================
@@ -1089,6 +1151,23 @@ generate_hardware_config() {
     HW_NIX+="  boot.initrd.services.lvm.enable = true;  # Ensure LVM userspace tools in initrd\n"
     HW_NIX+="  services.lvm.enable = true;      # Enable LVM tooling in the booted system\n"
     HW_NIX+="\n"
+
+    # LVM device filter — prevent duplicate PV detection on VMware
+    if [[ ${#LVM_PV_DEVICES[@]} -gt 0 ]]; then
+      local LVM_FILTER
+      LVM_FILTER=$(build_lvm_filter)
+      HW_NIX+="  # ── LVM device filter ──────────────────────────────────────\n"
+      HW_NIX+="  # Prevent duplicate PV detection on VMware (no disk serial numbers)\n"
+      HW_NIX+="  boot.initrd.systemd.contents.\"/etc/lvm/lvm.conf\".text = ''\n"
+      HW_NIX+="    devices {\n"
+      HW_NIX+="      global_filter = [ ${LVM_FILTER} ]\n"
+      HW_NIX+="      use_devicesfile = 0\n"
+      HW_NIX+="    }\n"
+      HW_NIX+="  '';\n"
+      HW_NIX+="\n"
+      info "LVM device filter: global_filter = [ ${LVM_FILTER} ]"
+    fi
+
   fi
 
   # VMware guest support
@@ -1496,6 +1575,22 @@ patch_configuration_nix() {
   sed -i '/networking\.useDHCP/d' "$CONF"
   sed -i '/services\.openssh\.enable/d' "$CONF"
   info "Removed conflicting networking/SSH lines from configuration.nix"
+
+  # Set networking.domain to first DNS search domain for proper FQDN
+  # (needed for Let's Encrypt ACME and other FQDN-dependent services)
+  if [[ ${#DNS_SEARCH_DOMAINS[@]} -gt 0 ]]; then
+    local NIXOS_DOMAIN="${DNS_SEARCH_DOMAINS[0]}"
+    if grep -q 'networking\.domain' "$CONF"; then
+      sed -i "s|networking\.domain = \"[^\"]*\";|networking.domain = \"${NIXOS_DOMAIN}\";|" "$CONF"
+      info "Set networking.domain = \"${NIXOS_DOMAIN}\" (from DNS search domain)"
+    else
+      # Add domain after hostName line if it doesn't exist
+      sed -i "/networking\.hostName/a\\  networking.domain = \"${NIXOS_DOMAIN}\";" "$CONF"
+      info "Added networking.domain = \"${NIXOS_DOMAIN}\" (from DNS search domain)"
+    fi
+  else
+    info "No DNS search domains detected — leaving networking.domain as-is"
+  fi
 }
 
 # Rebuild the NixOS system profile with corrected configs
@@ -1647,7 +1742,10 @@ main() {
       echo ""
       info "Step 4: Patch /etc/nixos/configuration.nix"
       detail "Add ./networking.nix to imports"
-      detail "Remove conflicting lines: networking.useDHCP, services.openssh.enable"
+    detail "Remove conflicting lines: networking.useDHCP, services.openssh.enable"
+    if [[ ${#DNS_SEARCH_DOMAINS[@]} -gt 0 ]]; then
+      detail "Set networking.domain = \"${DNS_SEARCH_DOMAINS[0]}\" (from DNS search domain)"
+    fi
       echo ""
       if $SWAP_IS_FILE; then
         info "Step 5: Preserve swap file through lustration"
