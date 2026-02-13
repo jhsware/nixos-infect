@@ -1164,10 +1164,9 @@ generate_networking_config() {
   # Core networking settings
   NET_NIX+="  # ── Core networking ──────────────────────────────────────────\n"
   NET_NIX+="  networking = {\n"
-  NET_NIX+="    hostName = \"$(hostname -s)\";\n"
+  NET_NIX+="    # NOTE: hostName and domain are set in configuration.nix (user-editable)\n"
+  NET_NIX+="    # Do NOT set them here to avoid NixOS module system conflicts.\n"
 
-  DOMAIN=$(hostname -d 2>/dev/null || true)
-  [[ -n "$DOMAIN" ]] && [[ "$DOMAIN" != "(none)" ]] && NET_NIX+="    domain = \"${DOMAIN}\";\n"
 
   NET_NIX+="\n"
   NET_NIX+="    useNetworkd = true;   # Use systemd-networkd (modern backend)\n"
@@ -1407,9 +1406,7 @@ patch_configuration_nix() {
   fi
 
   # Remove conflicting lines that nixos-infect sets
-  # These are now handled by networking.nix
-  sed -i '/networking\.hostName/d' "$CONF"
-  sed -i '/networking\.domain/d' "$CONF"
+  # These are now handled by networking.nix (hostName and domain stay in configuration.nix)
   sed -i '/networking\.useDHCP/d' "$CONF"
   sed -i '/services\.openssh\.enable/d' "$CONF"
   info "Removed conflicting networking/SSH lines from configuration.nix"
@@ -1529,7 +1526,7 @@ main() {
       echo ""
       info "Step 4: Patch /etc/nixos/configuration.nix"
       detail "Add ./networking.nix to imports"
-      detail "Remove conflicting lines: networking.hostName, networking.domain, networking.useDHCP, services.openssh.enable"
+      detail "Remove conflicting lines: networking.useDHCP, services.openssh.enable"
       echo ""
       if $SWAP_IS_FILE; then
         info "Step 5: Preserve swap file through lustration"
