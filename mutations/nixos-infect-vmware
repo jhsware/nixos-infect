@@ -1352,6 +1352,58 @@ generate_networking_config() {
 # Apply functions
 # ===========================================================================
 
+# Clean up stale NixOS configs from a previous provisioning run.
+# If networking.nix exists from a prior apply, it may conflict with the fresh
+# configuration.nix that nixos-infect generates (e.g. networking.domain set at
+# the same priority in both files). We back up and remove old configs since
+# replace_configs() will write fresh ones after nixos-infect completes.
+pre_cleanup_nixos_configs() {
+  if [[ ! -d /etc/nixos ]]; then
+    info "No existing /etc/nixos — clean install, skipping pre-cleanup"
+    return 0
+  fi
+
+  section "Pre-cleanup: neutralising stale NixOS configs"
+
+  # Back up old configs before removing them
+  local BACKUP_DIR="/etc/nixos/pre-cleanup-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$BACKUP_DIR"
+
+  local CLEANED=false
+  for nixfile in /etc/nixos/*.nix; do
+    [[ -f "$nixfile" ]] || continue
+    local basename
+    basename=$(basename "$nixfile")
+    cp "$nixfile" "$BACKUP_DIR/"
+    # Remove networking.nix entirely — we'll regenerate it
+    # Remove hardware-configuration.nix — nixos-infect will regenerate it
+    # Keep configuration.nix but strip the networking.nix import to prevent
+    # it from pulling in the (now removed) networking.nix during build
+    if [[ "$basename" == "networking.nix" ]] || [[ "$basename" == "hardware-configuration.nix" ]]; then
+      rm -f "$nixfile"
+      info "Removed stale $basename (backed up to $BACKUP_DIR/)"
+      CLEANED=true
+    fi
+  done
+
+  # Strip networking.nix import from configuration.nix if it exists
+  if [[ -f /etc/nixos/configuration.nix ]]; then
+    if grep -q 'networking\.nix' /etc/nixos/configuration.nix; then
+      sed -i '/\.\/networking\.nix/d' /etc/nixos/configuration.nix
+      info "Removed ./networking.nix import from configuration.nix"
+      CLEANED=true
+    fi
+  fi
+
+  if $CLEANED; then
+    info "Pre-cleanup complete (backups in $BACKUP_DIR)"
+  else
+    info "No stale configs found — nothing to clean"
+  fi
+}
+
+
+
 # Download and run nixos-infect with NO_REBOOT=1 and NO_INFECT to skip
 # the actual system build (we'll do that ourselves after replacing configs)
 run_nixos_infect() {
@@ -1546,7 +1598,13 @@ main() {
     if $DRY_RUN; then
       section "Dry Run — Planned Actions"
       echo ""
+      info "Step 0: Pre-cleanup stale NixOS configs (if re-provisioning)"
+      detail "Remove old networking.nix and hardware-configuration.nix"
+      detail "Strip networking.nix import from configuration.nix"
+      detail "Back up removed files to /etc/nixos/pre-cleanup-TIMESTAMP/"
+      echo ""
       info "Step 1: Download and run nixos-infect with NO_REBOOT=1"
+
       detail "URL: ${NIXOS_INFECT_URL}"
       detail "Channel: ${NIX_CHANNEL:-nixos-25.05}"
 
@@ -1597,7 +1655,9 @@ main() {
 
     # Actual apply
     section "Apply Mode"
+    pre_cleanup_nixos_configs
     run_nixos_infect
+
     replace_configs
     patch_configuration_nix
     rebuild_system
