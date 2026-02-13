@@ -59,6 +59,7 @@ LVM_LV=""
 declare -A LVM_LV_VG=()
 declare -A LVM_LV_NAME=()
 declare -A LVM_LV_SIZE=()
+declare -A LVM_PV_DEVICES=()  # PV device paths for LVM filter generation
 
 # Extra mounts
 declare -A EXTRA_MOUNTS=()
@@ -286,6 +287,15 @@ detect_lvm() {
         LVM_LV_SIZE["$local_dmpath"]="$local_size"
       done < <(lvs --noheadings -o vg_name,lv_name,lv_size,lv_dm_path 2>/dev/null)
 
+      # Collect PV device paths for LVM filter generation
+      while IFS= read -r pv_line; do
+        local pv_dev
+        pv_dev=$(echo "$pv_line" | awk '{print $1}')
+        [[ -n "$pv_dev" ]] && LVM_PV_DEVICES["$pv_dev"]=1
+      done < <(pvs --noheadings -o pv_name 2>/dev/null)
+
+
+
       # Identify root LV
       if [[ "$ROOT_DEV" == /dev/mapper/* ]] || [[ "$ROOT_DEV" == /dev/dm-* ]]; then
         ROOT_DEV_RESOLVED_TMP=$(readlink -f "$ROOT_DEV" 2>/dev/null || echo "$ROOT_DEV")
@@ -299,6 +309,9 @@ detect_lvm() {
         done
       fi
       info "LVM detected — VG: ${LVM_VG:-unknown}, LV: ${LVM_LV:-unknown}"
+      if [[ ${#LVM_PV_DEVICES[@]} -gt 0 ]]; then
+        detail "  PV devices: ${!LVM_PV_DEVICES[*]}"
+      fi
       warn "LVM requires dm_mod and lvm2 in initrd — this is the #1 cause of nixos-infect boot failures!"
     fi
   else
