@@ -1530,7 +1530,9 @@ rebuild_system() {
   info "Building NixOS system (this may take several minutes)..."
   nix-env -p /nix/var/nix/profiles/system \
     -I nixpkgs=$(realpath /root/.nix-defexpr/channels/nixos) \
+    -I nixos-config=/etc/nixos/configuration.nix \
     -f '<nixpkgs/nixos>' --set -A system || {
+
     error "System rebuild failed — check /etc/nixos/ for config errors"
     error "Your original configs are backed up in /etc/nixos/backup-*/"
     exit 1
