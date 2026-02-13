@@ -21,6 +21,19 @@
 
 set -euo pipefail
 
+
+# ===========================================================================
+# nixos-infect source configuration
+
+# ===========================================================================
+# Branch/tag of the jhsware nixos-infect fork to use
+NIXOS_INFECT_BRANCH="${NIXOS_INFECT_BRANCH:-ki-dev}"
+# Full URL to the nixos-infect script (uses NIXOS_INFECT_BRANCH by default)
+NIXOS_INFECT_URL="${NIXOS_INFECT_URL:-https://raw.githubusercontent.com/jhsware/nixos-infect/refs/heads/${NIXOS_INFECT_BRANCH}/nixos-infect}"
+
+# ===========================================================================
+
+
 # ===========================================================================
 # Global variables (populated by detection functions)
 # ===========================================================================
@@ -177,9 +190,11 @@ parse_args() {
         echo "  apply    Run nixos-infect + replace configs with VMware-aware versions"
         echo ""
         echo "Environment variables:"
-        echo "  NIX_CHANNEL       NixOS channel (default: nixos-25.05)"
-        echo "  NIXOS_INFECT_URL  URL to nixos-infect script"
-        echo "  PROVIDER          Cloud provider hint for nixos-infect"
+        echo "  NIX_CHANNEL          NixOS channel (default: nixos-25.05)"
+        echo "  NIXOS_INFECT_BRANCH  Branch of jhsware/nixos-infect fork (default: ki-dev)"
+        echo "  NIXOS_INFECT_URL     Full URL to nixos-infect script (overrides branch)"
+        echo "  PROVIDER             Cloud provider hint for nixos-infect"
+
         exit 0
         ;;
       *)
@@ -1310,13 +1325,11 @@ generate_networking_config() {
 run_nixos_infect() {
   section "Running nixos-infect (NO_REBOOT=1)"
 
-  local NIXOS_INFECT_URL="${NIXOS_INFECT_URL:-https://raw.githubusercontent.com/elitak/nixos-infect/master/nixos-infect}"
-  local NIX_CHANNEL="${NIX_CHANNEL:-nixos-25.05}"
-
   info "Downloading nixos-infect from: ${NIXOS_INFECT_URL}"
-  info "NixOS channel: ${NIX_CHANNEL}"
+  info "NixOS channel: ${NIX_CHANNEL:-nixos-25.05}"
 
   # Download nixos-infect to a temporary file
+
   local INFECT_SCRIPT
   INFECT_SCRIPT=$(mktemp /tmp/nixos-infect-vmware.XXXXXX)
   curl -L "${NIXOS_INFECT_URL}" -o "${INFECT_SCRIPT}" || {
@@ -1504,8 +1517,9 @@ main() {
       section "Dry Run — Planned Actions"
       echo ""
       info "Step 1: Download and run nixos-infect with NO_REBOOT=1"
-      detail "URL: ${NIXOS_INFECT_URL:-https://raw.githubusercontent.com/elitak/nixos-infect/master/nixos-infect}"
+      detail "URL: ${NIXOS_INFECT_URL}"
       detail "Channel: ${NIX_CHANNEL:-nixos-25.05}"
+
       echo ""
       info "Step 2: Backup existing /etc/nixos/*.nix to /etc/nixos/backup-TIMESTAMP/"
       echo ""
